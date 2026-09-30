@@ -1,0 +1,204 @@
+package googleapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+
+	"local-email-workspace/internal/credentials"
+)
+
+const gmailAPIBaseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+type GmailClient struct {
+	httpClient *http.Client
+}
+
+type Profile struct {
+	EmailAddress  string `json:"emailAddress"`
+	MessagesTotal int64  `json:"messagesTotal"`
+	ThreadsTotal  int64  `json:"threadsTotal"`
+	HistoryID     string `json:"historyId"`
+}
+
+type InboxMessage struct {
+	ID         string   `json:"id"`
+	ThreadID   string   `json:"threadId"`
+	Subject    string   `json:"subject"`
+	From       string   `json:"from"`
+	To         string   `json:"to"`
+	Date       string   `json:"date"`
+	Snippet    string   `json:"snippet"`
+	Unread     bool     `json:"unread"`
+	LabelIDs   []string `json:"labelIds"`
+	InternalAt string   `json:"internalAt"`
+}
+
+type InboxPage struct {
+	Messages      []InboxMessage `json:"messages"`
+	NextPageToken string         `json:"nextPageToken,omitempty"`
+	ResultSize    int            `json:"resultSize"`
+}
+
+type messageListResponse struct {
+	Messages []struct {
+		ID       string `json:"id"`
+		ThreadID string `json:"threadId"`
+	} `json:"messages"`
+	NextPageToken      string `json:"nextPageToken"`
+	ResultSizeEstimate int    `json:"resultSizeEstimate"`
+}
+
+type messageResponse struct {
+	ID           string   `json:"id"`
+	ThreadID     string   `json:"threadId"`
+	LabelIDs     []string `json:"labelIds"`
+	Snippet      string   `json:"snippet"`
+	InternalDate string   `json:"internalDate"`
+	Payload      struct {
+		Headers []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"headers"`
+	} `json:"payload"`
+}
+
+func NewGmailClient(httpClient *http.Client) *GmailClient {
+	return &GmailClient{httpClient: httpClient}
+}
+
+func (c *GmailClient) Profile(ctx context.Context, credential credentials.OAuthCredential) (Profile, error) {
+	var profile Profile
+	if err := c.getJSON(ctx, gmailAPIBaseURL+"/profile", credential, &profile); err != nil {
+		return Profile{}, err
+	}
+	return profile, nil
+}
+
+func (c *GmailClient) Inbox(ctx context.Context, credential credentials.OAuthCredential, rawLimit, pageToken string) (InboxPage, error) {
+	query := url.Values{
+		"labelIds":   {"INBOX"},
+		"maxResults": {strconv.Itoa(clampLimit(rawLimit))},
+	}
+	if pageToken != "" {
+		query.Set("pageToken", pageToken)
+	}
+
+	var listing messageListResponse
+	if err := c.getJSON(ctx, gmailAPIBaseURL+"/messages?"+query.Encode(), credential, &listing); err != nil {
+		return InboxPage{}, err
+	}
+
+	messages := make([]InboxMessage, len(listing.Messages))
+	var waitGroup sync.WaitGroup
+	semaphore := make(chan struct{}, 6)
+	errorsByIndex := make([]error, len(listing.Messages))
+
+	for index, reference := range listing.Messages {
+		index, reference := index, reference
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				errorsByIndex[index] = ctx.Err()
+				return
+			}
+			message, err := c.message(ctx, credential, reference.ID)
+			messages[index] = message
+			errorsByIndex[index] = err
+		}()
+	}
+	waitGroup.Wait()
+
+	for _, err := range errorsByIndex {
+		if err != nil {
+			return InboxPage{}, fmt.Errorf("fetch inbox message metadata: %w", err)
+		}
+	}
+
+	return InboxPage{
+		Messages:      messages,
+		NextPageToken: listing.NextPageToken,
+		ResultSize:    listing.ResultSizeEstimate,
+	}, nil
+}
+
+func (c *GmailClient) message(ctx context.Context, credential credentials.OAuthCredential, id string) (InboxMessage, error) {
+	query := url.Values{"format": {"metadata"}}
+	for _, header := range []string{"Subject", "From", "To", "Date", "Message-ID", "In-Reply-To", "References"} {
+		query.Add("metadataHeaders", header)
+	}
+
+	var response messageResponse
+	endpoint := gmailAPIBaseURL + "/messages/" + url.PathEscape(id) + "?" + query.Encode()
+	if err := c.getJSON(ctx, endpoint, credential, &response); err != nil {
+		return InboxMessage{}, err
+	}
+
+	headers := make(map[string]string, len(response.Payload.Headers))
+	for _, header := range response.Payload.Headers {
+		headers[strings.ToLower(header.Name)] = header.Value
+	}
+
+	return InboxMessage{
+		ID:         response.ID,
+		ThreadID:   response.ThreadID,
+		Subject:    fallback(headers["subject"], "(No subject)"),
+		From:       headers["from"],
+		To:         headers["to"],
+		Date:       headers["date"],
+		Snippet:    response.Snippet,
+		Unread:     contains(response.LabelIDs, "UNREAD"),
+		LabelIDs:   response.LabelIDs,
+		InternalAt: response.InternalDate,
+	}, nil
+}
+
+func (c *GmailClient) getJSON(ctx context.Context, endpoint string, credential credentials.OAuthCredential, target any) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create Gmail request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+credential.AccessToken)
+	request.Header.Set("Accept", "application/json")
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("call Gmail API: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
+		return fmt.Errorf("Gmail API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(target); err != nil {
+		return fmt.Errorf("decode Gmail response: %w", err)
+	}
+	return nil
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func fallback(value, defaultValue string) string {
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
