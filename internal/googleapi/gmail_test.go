@@ -38,7 +38,12 @@ func TestThreadRetrievesAndNormalizesConversationBodies(t *testing.T) {
 						"headers": [
 							{"name": "Subject", "value": "Approval request"},
 							{"name": "From", "value": "Morgan <morgan@example.com>"},
-							{"name": "To", "value": "person@example.com"}
+							{"name": "To", "value": "person@example.com"},
+							{"name": "List-Unsubscribe", "value": "<https://example.com/unsubscribe>"},
+							{"name": "List-ID", "value": "campaign.example.com"},
+							{"name": "Precedence", "value": "bulk"},
+							{"name": "Auto-Submitted", "value": "auto-generated"},
+							{"name": "Feedback-ID", "value": "campaign:example"}
 						],
 						"parts": [
 							{"mimeType": "text/html", "body": {"data": "` + htmlBody + `"}},
@@ -73,6 +78,11 @@ func TestThreadRetrievesAndNormalizesConversationBodies(t *testing.T) {
 	}
 	if conversation.Messages[1].Body != "Plain body\n\nPlease approve by Friday." || conversation.Messages[1].BodySource != "plain" {
 		t.Fatalf("second message = %#v", conversation.Messages[1])
+	}
+	if !conversation.Messages[1].HasListUnsubscribe || !conversation.Messages[1].HasListID ||
+		conversation.Messages[1].Precedence != "bulk" || !conversation.Messages[1].AutoSubmitted ||
+		!conversation.Messages[1].HasFeedbackID {
+		t.Fatalf("bulk indicators = %#v", conversation.Messages[1])
 	}
 }
 

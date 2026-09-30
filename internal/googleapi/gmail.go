@@ -66,20 +66,25 @@ type Conversation struct {
 }
 
 type ConversationMessage struct {
-	ID                string   `json:"id"`
-	ThreadID          string   `json:"threadId"`
-	RFCMessageID      string   `json:"rfcMessageId,omitempty"`
-	Subject           string   `json:"subject"`
-	From              string   `json:"from"`
-	To                string   `json:"to"`
-	Cc                string   `json:"cc,omitempty"`
-	Date              string   `json:"date"`
-	InternalAt        string   `json:"internalAt"`
-	LabelIDs          []string `json:"labelIds"`
-	Body              string   `json:"body"`
-	BodySource        string   `json:"bodySource"`
-	BodyTruncated     bool     `json:"bodyTruncated"`
-	SuspiciousContent bool     `json:"suspiciousContent"`
+	ID                 string   `json:"id"`
+	ThreadID           string   `json:"threadId"`
+	RFCMessageID       string   `json:"rfcMessageId,omitempty"`
+	Subject            string   `json:"subject"`
+	From               string   `json:"from"`
+	To                 string   `json:"to"`
+	Cc                 string   `json:"cc,omitempty"`
+	Date               string   `json:"date"`
+	InternalAt         string   `json:"internalAt"`
+	LabelIDs           []string `json:"labelIds"`
+	Body               string   `json:"body"`
+	BodySource         string   `json:"bodySource"`
+	BodyTruncated      bool     `json:"bodyTruncated"`
+	SuspiciousContent  bool     `json:"suspiciousContent"`
+	HasListUnsubscribe bool     `json:"hasListUnsubscribe"`
+	HasListID          bool     `json:"hasListId"`
+	Precedence         string   `json:"precedence,omitempty"`
+	AutoSubmitted      bool     `json:"autoSubmitted"`
+	HasFeedbackID      bool     `json:"hasFeedbackId"`
 }
 
 type messageListResponse struct {
@@ -240,22 +245,32 @@ func (c *GmailClient) normalizeConversationMessage(
 	}
 	result := mailbody.Normalize(part)
 	headers := headerValues(message.Payload.Headers)
+	precedence := strings.ToLower(strings.TrimSpace(headers["precedence"]))
+	if precedence != "bulk" && precedence != "list" && precedence != "junk" {
+		precedence = ""
+	}
+	autoSubmitted := strings.ToLower(strings.TrimSpace(headers["auto-submitted"]))
 
 	return ConversationMessage{
-		ID:                message.ID,
-		ThreadID:          message.ThreadID,
-		RFCMessageID:      headers["message-id"],
-		Subject:           fallback(headers["subject"], "(No subject)"),
-		From:              headers["from"],
-		To:                headers["to"],
-		Cc:                headers["cc"],
-		Date:              headers["date"],
-		InternalAt:        message.InternalDate,
-		LabelIDs:          message.LabelIDs,
-		Body:              result.Text,
-		BodySource:        fallback(result.Source, "none"),
-		BodyTruncated:     result.Truncated,
-		SuspiciousContent: result.SuspiciousContent,
+		ID:                 message.ID,
+		ThreadID:           message.ThreadID,
+		RFCMessageID:       headers["message-id"],
+		Subject:            fallback(headers["subject"], "(No subject)"),
+		From:               headers["from"],
+		To:                 headers["to"],
+		Cc:                 headers["cc"],
+		Date:               headers["date"],
+		InternalAt:         message.InternalDate,
+		LabelIDs:           message.LabelIDs,
+		Body:               result.Text,
+		BodySource:         fallback(result.Source, "none"),
+		BodyTruncated:      result.Truncated,
+		SuspiciousContent:  result.SuspiciousContent,
+		HasListUnsubscribe: headers["list-unsubscribe"] != "",
+		HasListID:          headers["list-id"] != "",
+		Precedence:         precedence,
+		AutoSubmitted:      autoSubmitted != "" && autoSubmitted != "no",
+		HasFeedbackID:      headers["feedback-id"] != "",
 	}, nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/googleapi"
 	"local-email-workspace/internal/ollama"
+	"local-email-workspace/internal/triage"
 )
 
 const sessionCookieName = "lew_session"
@@ -36,6 +37,7 @@ type Server struct {
 	oauth    *googleapi.OAuthClient
 	gmail    *googleapi.GmailClient
 	ollama   *ollama.Client
+	triage   *triage.Service
 	mux      *http.ServeMux
 	mu       sync.RWMutex
 	sessions map[string]time.Time
@@ -43,12 +45,14 @@ type Server struct {
 }
 
 func New(cfg config.Config, store credentials.Store, httpClient *http.Client) *Server {
+	ollamaClient := ollama.NewClient(cfg.OllamaBaseURL, httpClient)
 	server := &Server{
 		config:   cfg,
 		store:    store,
 		oauth:    googleapi.NewOAuthClient(httpClient, cfg.GmailClientID, cfg.GmailClientSecret, cfg.OAuthRedirectURL),
 		gmail:    googleapi.NewGmailClient(httpClient),
-		ollama:   ollama.NewClient(cfg.OllamaBaseURL, httpClient),
+		ollama:   ollamaClient,
+		triage:   triage.NewService(ollamaClient),
 		mux:      http.NewServeMux(),
 		sessions: make(map[string]time.Time),
 		pending:  make(map[string]pendingAuthorization),
@@ -70,6 +74,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/auth/gmail/disconnect", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleGmailDisconnect))))
 	s.mux.Handle("GET /api/v1/gmail/messages", s.authenticated(http.HandlerFunc(s.handleInbox)))
 	s.mux.Handle("GET /api/v1/gmail/threads/{threadID}", s.authenticated(http.HandlerFunc(s.handleThread)))
+	s.mux.Handle("POST /api/v1/gmail/threads/{threadID}/triage", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleThreadTriage))))
 	s.mux.Handle("GET /api/v1/ollama/status", s.authenticated(http.HandlerFunc(s.handleOllamaStatus)))
 }
 
@@ -100,9 +105,27 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 			Size:              model.Size,
 		}
 	}
+	triageModel := s.config.OllamaModel
+	message := ""
+	if triageModel == "" && len(models) == 1 {
+		triageModel = models[0].Name
+	} else if triageModel == "" && len(models) > 1 {
+		message = "Set OLLAMA_MODEL to choose which installed model performs email triage."
+	} else if triageModel != "" {
+		found := false
+		for _, model := range models {
+			found = found || model.Name == triageModel
+		}
+		if !found {
+			message = "The configured OLLAMA_MODEL is not installed."
+			triageModel = ""
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"available": true,
-		"models":    responseModels,
+		"available":   true,
+		"models":      responseModels,
+		"triageModel": triageModel,
+		"message":     message,
 	})
 }
 
@@ -279,6 +302,92 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, conversation)
+}
+
+type threadTriageResponse struct {
+	Conversation googleapi.Conversation `json:"conversation"`
+	Triage       triage.Assessment      `json:"triage"`
+}
+
+func (s *Server) handleThreadTriage(w http.ResponseWriter, r *http.Request) {
+	threadID := r.PathValue("threadID")
+	if threadID == "" || len(threadID) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_thread_id", "A valid Gmail thread ID is required.")
+		return
+	}
+	credential, err := s.validCredential(r.Context())
+	if errors.Is(err, credentials.ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "gmail_not_connected", "Connect Gmail before triaging a conversation.")
+		return
+	}
+	if err != nil {
+		slog.Error("gmail credential refresh failed", "error", err)
+		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
+		return
+	}
+	conversation, err := s.gmail.Thread(r.Context(), credential, threadID)
+	if err != nil {
+		slog.Error("gmail thread request failed during triage", "error", err)
+		writeError(w, http.StatusBadGateway, "gmail_thread_request_failed", "Could not retrieve the conversation from Gmail.")
+		return
+	}
+
+	messages := make([]triage.Message, len(conversation.Messages))
+	for index, message := range conversation.Messages {
+		messages[index] = triage.Message{
+			ID:                 message.ID,
+			Subject:            message.Subject,
+			From:               message.From,
+			To:                 message.To,
+			Cc:                 message.Cc,
+			Date:               message.Date,
+			Body:               message.Body,
+			LabelIDs:           message.LabelIDs,
+			SuspiciousContent:  message.SuspiciousContent,
+			HasListUnsubscribe: message.HasListUnsubscribe,
+			HasListID:          message.HasListID,
+			Precedence:         message.Precedence,
+			AutoSubmitted:      message.AutoSubmitted,
+			HasFeedbackID:      message.HasFeedbackID,
+		}
+	}
+	assessment := triage.Baseline(messages, credential.EmailAddress)
+	if assessment.NeedsAI {
+		model, modelErr := s.selectedOllamaModel(r.Context())
+		if modelErr != nil {
+			assessment.AIStatus = "unavailable"
+		} else {
+			modelAssessment, inferenceErr := s.triage.Evaluate(r.Context(), model, messages)
+			if inferenceErr != nil {
+				assessment.AIStatus = "failed"
+				slog.Warn("local email triage failed", "reason", "inference_or_validation_failed")
+			} else {
+				assessment = triage.ApplyPolicy(assessment, modelAssessment)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, threadTriageResponse{
+		Conversation: conversation,
+		Triage:       assessment,
+	})
+}
+
+func (s *Server) selectedOllamaModel(ctx context.Context) (string, error) {
+	if s.config.OllamaModel != "" {
+		return s.config.OllamaModel, nil
+	}
+	models, err := s.ollama.InstalledModels(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(models) == 0 {
+		return "", fmt.Errorf("no Ollama model is installed")
+	}
+	if len(models) > 1 {
+		return "", fmt.Errorf("OLLAMA_MODEL is required when multiple models are installed")
+	}
+	return models[0].Name, nil
 }
 
 func (s *Server) handleGmailDisconnect(w http.ResponseWriter, r *http.Request) {

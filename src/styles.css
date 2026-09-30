@@ -406,6 +406,14 @@ h1 {
   font-weight: 600;
 }
 
+.low-priority-tag {
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: #66706c;
+  background: #ecefed;
+  font-weight: 600;
+}
+
 .thread-detail {
   display: flex;
   height: 100vh;

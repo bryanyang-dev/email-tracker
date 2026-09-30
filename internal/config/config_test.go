@@ -64,6 +64,18 @@ func TestLoadAllowsDisablingOllamaAutoStart(t *testing.T) {
 	}
 }
 
+func TestLoadReadsPreferredOllamaModel(t *testing.T) {
+	t.Setenv("OLLAMA_MODEL", "  qwen2.5:3b  ")
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.OllamaModel != "qwen2.5:3b" {
+		t.Fatalf("OllamaModel = %q", got.OllamaModel)
+	}
+}
+
 func TestLoadRejectsInvalidOllamaAutoStart(t *testing.T) {
 	t.Setenv("OLLAMA_AUTO_START", "sometimes")
 

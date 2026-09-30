@@ -38,6 +38,11 @@ export interface GmailConversationMessage {
   bodySource: "plain" | "html" | "mixed" | "none";
   bodyTruncated: boolean;
   suspiciousContent: boolean;
+  hasListUnsubscribe?: boolean;
+  hasListId?: boolean;
+  precedence?: string;
+  autoSubmitted?: boolean;
+  hasFeedbackId?: boolean;
 }
 
 export interface GmailConversation {
@@ -45,6 +50,23 @@ export interface GmailConversation {
   historyId: string;
   messages: GmailConversationMessage[];
   truncated: boolean;
+}
+
+export interface GmailTriageAssessment {
+  visibility: "active" | "suggested" | "all";
+  category: string;
+  needsAction: boolean;
+  urgent: boolean;
+  confidence: number;
+  reasonCodes: string[];
+  sourceMessageIds: string[];
+  aiStatus: "applied" | "rules" | "unavailable" | "failed";
+  model?: string;
+}
+
+export interface GmailThreadTriage {
+  conversation: GmailConversation;
+  triage: GmailTriageAssessment;
 }
 
 export interface OllamaModel {
@@ -57,6 +79,7 @@ export interface OllamaModel {
 export interface OllamaStatus {
   available: boolean;
   models: OllamaModel[];
+  triageModel?: string;
   message?: string;
 }
 
@@ -132,6 +155,12 @@ export function loadGmailInbox(pageToken = ""): Promise<GmailInboxPage> {
 
 export function loadGmailConversation(threadId: string): Promise<GmailConversation> {
   return request(`/api/v1/gmail/threads/${encodeURIComponent(threadId)}`);
+}
+
+export function triageGmailConversation(threadId: string): Promise<GmailThreadTriage> {
+  return request(`/api/v1/gmail/threads/${encodeURIComponent(threadId)}/triage`, {
+    method: "POST",
+  });
 }
 
 export function ollamaStatus(): Promise<OllamaStatus> {

@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -52,6 +53,48 @@ func TestInstalledModelsRejectsUnexpectedStatus(t *testing.T) {
 	client := NewClient("http://127.0.0.1:11434", httpClient)
 	if _, err := client.InstalledModels(context.Background()); err == nil {
 		t.Fatal("InstalledModels() succeeded for a non-200 response")
+	}
+}
+
+func TestGenerateStructuredUsesSchemaAndNonStreamingResponse(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/generate" {
+			t.Fatalf("request = %s %s, want POST /api/generate", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if body["model"] != "qwen2.5:3b" || body["stream"] != false {
+			t.Fatalf("body = %#v", body)
+		}
+		if body["think"] != false || body["keep_alive"] != "15m" {
+			t.Fatalf("generation controls = %#v", body)
+		}
+		options, ok := body["options"].(map[string]any)
+		if !ok || options["num_predict"] != float64(160) || options["num_ctx"] != float64(4096) {
+			t.Fatalf("options = %#v", body["options"])
+		}
+		format, ok := body["format"].(map[string]any)
+		if !ok || format["type"] != "object" {
+			t.Fatalf("format = %#v", body["format"])
+		}
+		return jsonResponse(http.StatusOK, `{"response":"{\"visibility\":\"all\"}","done":true}`), nil
+	})}
+	client := NewClient("http://127.0.0.1:11434", httpClient)
+
+	result, err := client.GenerateStructured(
+		context.Background(),
+		"qwen2.5:3b",
+		"fixed system prompt",
+		"untrusted input",
+		map[string]any{"type": "object"},
+	)
+	if err != nil {
+		t.Fatalf("GenerateStructured() error = %v", err)
+	}
+	if string(result) != `{"visibility":"all"}` {
+		t.Fatalf("result = %s", result)
 	}
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   APIError,
   beginGmailAuthorization,
@@ -7,8 +7,11 @@ import {
   loadGmailConversation,
   loadGmailInbox,
   ollamaStatus,
+  triageGmailConversation,
   type GmailConversation,
   type GmailInboxMessage,
+  type GmailThreadTriage,
+  type GmailTriageAssessment,
 } from "./api";
 import { navigationItems } from "./navigation";
 import type { ConnectionState, EmailThread, LocalAIState, ThreadView } from "./types";
@@ -38,6 +41,7 @@ export function App() {
   const [nextPageToken, setNextPageToken] = useState("");
   const [conversations, setConversations] = useState<Record<string, GmailConversation>>({});
   const [conversationLoadingId, setConversationLoadingId] = useState("");
+  const triageCache = useRef(new Map<string, GmailThreadTriage>());
   const threads = useMemo(() => threadsForView(view, allThreads), [view, allThreads]);
   const selected =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
@@ -105,7 +109,12 @@ export function App() {
       const status = await ollamaStatus();
       setLocalAI(
         status.available
-          ? { status: "available", models: status.models.map((model) => model.name) }
+          ? {
+              status: "available",
+              models: status.models.map((model) => model.name),
+              triageModel: status.triageModel,
+              message: status.message,
+            }
           : { status: "unavailable", message: status.message ?? "Ollama is unavailable." },
       );
     } catch {
@@ -124,7 +133,39 @@ export function App() {
       setSelectedId((current) =>
         nextThreads.some((thread) => thread.id === current) ? current : (nextThreads[0]?.id ?? ""),
       );
-      setNotice(null);
+      const triageResults: Array<{
+        thread: EmailThread;
+        conversation?: GmailConversation;
+      }> = [];
+      for (const thread of nextThreads) {
+        try {
+          const cacheKey = `${thread.gmailThreadId}:${thread.id}`;
+          const result =
+            triageCache.current.get(cacheKey) ??
+            (await triageGmailConversation(thread.gmailThreadId));
+          triageCache.current.set(cacheKey, result);
+          triageResults.push({
+            thread: applyTriage(thread, result.triage),
+            conversation: result.conversation,
+          });
+          setConversations((current) => ({
+            ...current,
+            [thread.gmailThreadId]: result.conversation,
+          }));
+        } catch {
+          triageResults.push({ thread: { ...thread, triageStatus: "failed" } });
+        }
+        setAllThreads([
+          ...triageResults.map((result) => result.thread),
+          ...nextThreads.slice(triageResults.length),
+        ]);
+      }
+      setAllThreads(triageResults.map((result) => result.thread));
+      setNotice(
+        triageResults.some((result) => result.thread.triageStatus === "failed")
+          ? "Some conversations could not be triaged and remain in Suggested."
+          : null,
+      );
     } catch (error) {
       setNotice(errorMessage(error));
     } finally {
@@ -290,6 +331,8 @@ export function App() {
                 <span className="preview">{thread.preview}</span>
                 <span className="thread-meta">
                   {thread.needsAttention && <span className="attention-tag">Needs attention</span>}
+                  {thread.state === "suggested" && <span className="attention-tag">Suggested</span>}
+                  {thread.state === "ordinary" && <span className="low-priority-tag">Low priority</span>}
                   <span>{thread.messageCount} messages</span>
                 </span>
               </button>
@@ -380,6 +423,14 @@ function ThreadDetail({
 
         <section className="panel">
           <div className="panel-heading">
+            <h3>Triage</h3>
+            <span>{triageStatusLabel(thread.triageStatus)}</span>
+          </div>
+          <p>{triageExplanation(thread)}</p>
+        </section>
+
+        <section className="panel">
+          <div className="panel-heading">
             <h3>Action items</h3>
             <span>{thread.actionItems.length}</span>
           </div>
@@ -457,7 +508,7 @@ function ConnectionBanner({
       <span>
         {connected
           ? inboxLoading
-            ? "Refreshing Gmail inbox…"
+            ? "Loading and triaging recent Gmail conversations…"
             : `Connected as ${connection.emailAddress}`
           : connectionLabel(connection)}
       </span>
@@ -525,13 +576,61 @@ function messageToThread(message: GmailInboxMessage): EmailThread {
     preview: message.snippet,
     latestUpdate: message.snippet || "No message preview is available.",
     summary: "Local AI enrichment has not run for this conversation yet.",
-    state: "active",
+    state: "suggested",
     needsAttention: false,
     unread: message.unread,
     actionItems: [],
     attachmentCount: 0,
     messageCount: 1,
+    triageCategory: "other",
+    triageReasons: [],
+    triageStatus: "pending",
   };
+}
+
+function applyTriage(thread: EmailThread, assessment: GmailTriageAssessment): EmailThread {
+  return {
+    ...thread,
+    state: assessment.visibility === "all" ? "ordinary" : assessment.visibility,
+    needsAttention: assessment.needsAction || assessment.urgent,
+    triageCategory: assessment.category,
+    triageReasons: assessment.reasonCodes,
+    triageStatus: assessment.aiStatus,
+  };
+}
+
+function triageStatusLabel(status: EmailThread["triageStatus"]): string {
+  switch (status) {
+    case "pending":
+      return "Reviewing";
+    case "applied":
+      return "Local AI";
+    case "rules":
+      return "Rules";
+    case "unavailable":
+      return "Rules only";
+    case "failed":
+      return "Needs review";
+  }
+}
+
+function triageExplanation(thread: EmailThread): string {
+  if (thread.triageStatus === "pending") return "This conversation is waiting for local triage.";
+  if (thread.triageStatus === "failed") {
+    return "Local triage failed, so this conversation remains visible in Suggested and All threads.";
+  }
+  let explanation: string;
+  if (thread.state === "active") {
+    explanation = thread.needsAttention
+      ? "Shown in Active because it appears urgent or requires an action."
+      : "Shown in Active because it met an importance floor or contains an important update.";
+  } else if (thread.state === "suggested") {
+    explanation = "Kept in Suggested because its importance or required action is uncertain.";
+  } else {
+    explanation = `Kept out of Active because it was classified as ${thread.triageCategory.replaceAll("_", " ")}. It remains available in All threads.`;
+  }
+  const reasons = thread.triageReasons.map((reason) => reason.replaceAll("_", " "));
+  return reasons.length ? `${explanation} Signals: ${reasons.join(", ")}.` : explanation;
 }
 
 function displayMessageDate(message: GmailInboxMessage): string {
@@ -567,6 +666,8 @@ function localAILabel(localAI: LocalAIState): string {
     case "unavailable":
       return localAI.message;
     case "available":
+      if (!localAI.triageModel && localAI.message) return localAI.message;
+      if (localAI.triageModel) return localAI.triageModel;
       if (localAI.models.length === 0) return "No models installed";
       if (localAI.models.length === 1) return localAI.models[0] ?? "1 model installed";
       return `${localAI.models.length} models installed`;
@@ -576,7 +677,7 @@ function localAILabel(localAI: LocalAIState): string {
 function localAITitle(localAI: LocalAIState): string {
   if (localAI.status === "checking") return "Checking local AI";
   if (localAI.status === "unavailable") return "Local AI unavailable";
-  return localAI.models.length ? "Local AI ready" : "Ollama running";
+  return localAI.triageModel ? "Local AI ready" : "Ollama running";
 }
 
 function errorMessage(error: unknown): string {

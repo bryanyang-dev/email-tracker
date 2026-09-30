@@ -23,12 +23,15 @@ export interface EmailThread {
   preview: string;
   latestUpdate: string;
   summary: string;
-  state: Exclude<ThreadView, "attention" | "all">;
+  state: "active" | "suggested" | "snoozed" | "resolved" | "ordinary";
   needsAttention: boolean;
   unread: boolean;
   actionItems: ActionItem[];
   attachmentCount: number;
   messageCount: number;
+  triageCategory: string;
+  triageReasons: string[];
+  triageStatus: "pending" | "applied" | "rules" | "unavailable" | "failed";
 }
 
 export type ConnectionState =
@@ -41,4 +44,4 @@ export type ConnectionState =
 export type LocalAIState =
   | { status: "checking" }
   | { status: "unavailable"; message: string }
-  | { status: "available"; models: string[] };
+  | { status: "available"; models: string[]; triageModel?: string; message?: string };

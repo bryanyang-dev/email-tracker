@@ -126,8 +126,10 @@ optional for desktop clients. The OAuth callback is
 
 ## Ollama development setup
 
-The Go service checks Ollama at `http://127.0.0.1:11434` and exposes only model
-availability to the React client. React never connects to Ollama directly.
+The Go service checks Ollama at `http://127.0.0.1:11434`. React never connects
+to Ollama directly. The service sends one bounded, normalized conversation at a
+time for structured local triage and validates the model response before using
+it to choose Active, Suggested, or All Threads visibility.
 
 When the Go API starts, it checks the configured endpoint and runs the installed
 `ollama serve` command only if Ollama is unavailable. The child process is bound
@@ -139,3 +141,7 @@ back to a cloud model.
 To use a different local port, set `OLLAMA_BASE_URL` in `.env`. The URL must use
 plain HTTP and the literal `127.0.0.1` host. Set `OLLAMA_AUTO_START=false` to
 require Ollama to be started independently.
+
+Set `OLLAMA_MODEL` to the installed model name used for email triage. When it is
+empty, the service uses the only installed model. If several models are
+installed, set this value explicitly so model selection is predictable.

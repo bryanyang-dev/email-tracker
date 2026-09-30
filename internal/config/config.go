@@ -29,6 +29,7 @@ type Config struct {
 	OAuthRedirectURL  string
 	OllamaBaseURL     string
 	OllamaAutoStart   bool
+	OllamaModel       string
 }
 
 func Load() (Config, error) {
@@ -62,6 +63,7 @@ func Load() (Config, error) {
 		OAuthRedirectURL:  "http://" + address + "/api/v1/auth/gmail/callback",
 		OllamaBaseURL:     ollamaBaseURL,
 		OllamaAutoStart:   ollamaAutoStart,
+		OllamaModel:       strings.TrimSpace(os.Getenv("OLLAMA_MODEL")),
 	}, nil
 }
 
