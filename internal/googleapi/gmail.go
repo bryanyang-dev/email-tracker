@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/mailbody"
@@ -402,20 +403,52 @@ func (c *GmailClient) getJSONLimit(
 	request.Header.Set("Authorization", "Bearer "+credential.AccessToken)
 	request.Header.Set("Accept", "application/json")
 
+	startedAt := time.Now()
+	operation := gmailOperation(endpoint)
 	response, err := c.httpClient.Do(request)
 	if err != nil {
+		logOutboundCall(ctx, "gmail", operation, http.MethodGet, 0, "error", startedAt)
 		return fmt.Errorf("call Gmail API: %w", err)
 	}
-	defer response.Body.Close()
+	outcome := "success"
+	defer func() {
+		response.Body.Close()
+		logOutboundCall(ctx, "gmail", operation, http.MethodGet, response.StatusCode, outcome, startedAt)
+	}()
 
 	if response.StatusCode != http.StatusOK {
+		outcome = "error"
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
 		return fmt.Errorf("Gmail API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, responseLimit)).Decode(target); err != nil {
+		outcome = "error"
 		return fmt.Errorf("decode Gmail response: %w", err)
 	}
 	return nil
+}
+
+func gmailOperation(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "unknown"
+	}
+	path := strings.TrimPrefix(parsed.Path, "/gmail/v1/users/me/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	switch {
+	case len(parts) == 1 && parts[0] == "profile":
+		return "get_profile"
+	case len(parts) == 1 && parts[0] == "messages":
+		return "list_messages"
+	case len(parts) == 2 && parts[0] == "messages":
+		return "get_message"
+	case len(parts) == 4 && parts[0] == "messages" && parts[2] == "attachments":
+		return "get_attachment"
+	case len(parts) == 2 && parts[0] == "threads":
+		return "get_thread"
+	default:
+		return "unknown"
+	}
 }
 
 func headerValues(headers []messageHeader) map[string]string {

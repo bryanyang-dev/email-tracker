@@ -19,6 +19,7 @@ import (
 	"local-email-workspace/internal/config"
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/googleapi"
+	"local-email-workspace/internal/observability"
 	"local-email-workspace/internal/ollama"
 	"local-email-workspace/internal/triage"
 )
@@ -62,7 +63,7 @@ func New(cfg config.Config, store credentials.Store, httpClient *http.Client) *S
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.securityHeaders(s.requireLoopbackHost(s.mux))
+	return s.requestLogger(s.securityHeaders(s.requireLoopbackHost(s.mux)))
 }
 
 func (s *Server) routes() {
@@ -142,18 +143,33 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now()
+	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+		s.mu.Lock()
+		s.pruneLocked(now)
+		expiresAt, found := s.sessions[cookie.Value]
+		s.mu.Unlock()
+		if found {
+			setSessionCookie(w, cookie.Value, expiresAt)
+			slog.Info("local session reused", "request_id", requestIDFromContext(r.Context()))
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+			return
+		}
+	}
+
 	sessionID, err := randomURLToken(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_failed", "Could not create a local session.")
 		return
 	}
-	expiresAt := time.Now().Add(12 * time.Hour)
+	expiresAt := now.Add(12 * time.Hour)
 	s.mu.Lock()
 	s.sessions[sessionID] = expiresAt
-	s.pruneLocked(time.Now())
+	s.pruneLocked(now)
 	s.mu.Unlock()
 
 	setSessionCookie(w, sessionID, expiresAt)
+	slog.Info("local session created", "request_id", requestIDFromContext(r.Context()))
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "ready"})
 }
 
@@ -206,6 +222,7 @@ func (s *Server) handleGmailStart(w http.ResponseWriter, r *http.Request) {
 	s.pruneLocked(time.Now())
 	s.mu.Unlock()
 
+	slog.Info("gmail authorization started", "request_id", requestIDFromContext(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]string{
 		"authorizationUrl": s.oauth.AuthorizationURL(state, challenge),
 	})
@@ -236,19 +253,19 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 
 	credential, err := s.oauth.Exchange(r.Context(), code, pending.verifier)
 	if err != nil {
-		slog.Error("gmail oauth exchange failed", "error", err)
+		slog.Error("gmail authorization failed", "request_id", requestIDFromContext(r.Context()), "stage", "token_exchange")
 		s.redirectWithResult(w, r, "error", "token_exchange_failed", pending.sessionID)
 		return
 	}
 	profile, err := s.gmail.Profile(r.Context(), credential)
 	if err != nil {
-		slog.Error("gmail profile request failed", "error", err)
+		slog.Error("gmail authorization failed", "request_id", requestIDFromContext(r.Context()), "stage", "profile")
 		s.redirectWithResult(w, r, "error", "gmail_profile_failed", pending.sessionID)
 		return
 	}
 	credential.EmailAddress = profile.EmailAddress
 	if err := s.store.Save(r.Context(), credential); err != nil {
-		slog.Error("gmail credential save failed", "error", err)
+		slog.Error("gmail authorization failed", "request_id", requestIDFromContext(r.Context()), "stage", "credential_save")
 		s.redirectWithResult(w, r, "error", "credential_store_failed", pending.sessionID)
 		return
 	}
@@ -263,17 +280,23 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		slog.Error("gmail credential refresh failed", "error", err)
+		slog.Error("gmail credential unavailable", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
 		return
 	}
 
 	page, err := s.gmail.Inbox(r.Context(), credential, r.URL.Query().Get("limit"), r.URL.Query().Get("pageToken"))
 	if err != nil {
-		slog.Error("gmail inbox request failed", "error", err)
+		slog.Error("gmail inbox load failed", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusBadGateway, "gmail_request_failed", "Could not retrieve messages from Gmail.")
 		return
 	}
+	slog.Info("gmail inbox loaded",
+		"request_id", requestIDFromContext(r.Context()),
+		"message_count", len(page.Messages),
+		"has_next_page", page.NextPageToken != "",
+		"result_size", page.ResultSize,
+	)
 	writeJSON(w, http.StatusOK, page)
 }
 
@@ -290,17 +313,22 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		slog.Error("gmail credential refresh failed", "error", err)
+		slog.Error("gmail credential unavailable", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
 		return
 	}
 
 	conversation, err := s.gmail.Thread(r.Context(), credential, threadID)
 	if err != nil {
-		slog.Error("gmail thread request failed", "error", err)
+		slog.Error("gmail conversation load failed", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusBadGateway, "gmail_thread_request_failed", "Could not retrieve the conversation from Gmail.")
 		return
 	}
+	slog.Info("gmail conversation loaded",
+		"request_id", requestIDFromContext(r.Context()),
+		"message_count", len(conversation.Messages),
+		"truncated", conversation.Truncated,
+	)
 	writeJSON(w, http.StatusOK, conversation)
 }
 
@@ -310,6 +338,7 @@ type threadTriageResponse struct {
 }
 
 func (s *Server) handleThreadTriage(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	threadID := r.PathValue("threadID")
 	if threadID == "" || len(threadID) > 256 {
 		writeError(w, http.StatusBadRequest, "invalid_thread_id", "A valid Gmail thread ID is required.")
@@ -321,13 +350,13 @@ func (s *Server) handleThreadTriage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		slog.Error("gmail credential refresh failed", "error", err)
+		slog.Error("gmail credential unavailable", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
 		return
 	}
 	conversation, err := s.gmail.Thread(r.Context(), credential, threadID)
 	if err != nil {
-		slog.Error("gmail thread request failed during triage", "error", err)
+		slog.Error("gmail conversation load failed during triage", "request_id", requestIDFromContext(r.Context()))
 		writeError(w, http.StatusBadGateway, "gmail_thread_request_failed", "Could not retrieve the conversation from Gmail.")
 		return
 	}
@@ -352,25 +381,96 @@ func (s *Server) handleThreadTriage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	assessment := triage.Baseline(messages, credential.EmailAddress)
+	aiRequested := assessment.NeedsAI
+	if !assessment.NeedsAI {
+		slog.Info("gmail triage resolved by rules",
+			"request_id", requestIDFromContext(r.Context()),
+			"needs_ai", false,
+			"message_count", len(messages),
+			"visibility", assessment.Visibility,
+			"category", assessment.Category,
+			"reason_codes", assessment.ReasonCodes,
+		)
+	}
 	if assessment.NeedsAI {
 		model, modelErr := s.selectedOllamaModel(r.Context())
 		if modelErr != nil {
 			assessment.AIStatus = "unavailable"
+			slog.Warn("local email triage failed",
+				"request_id", requestIDFromContext(r.Context()),
+				"stage", string(triage.StageModelSelection),
+				"reason", string(observability.ReasonFromError(modelErr, ReasonModelSelectionFailed)),
+			)
 		} else {
 			modelAssessment, inferenceErr := s.triage.Evaluate(r.Context(), model, messages)
 			if inferenceErr != nil {
 				assessment.AIStatus = "failed"
-				slog.Warn("local email triage failed", "reason", "inference_or_validation_failed")
+				stage, reason := triageFailureDetails(inferenceErr)
+				slog.Warn("local email triage failed",
+					"request_id", requestIDFromContext(r.Context()),
+					"stage", string(stage),
+					"reason", string(reason),
+				)
 			} else {
 				assessment = triage.ApplyPolicy(assessment, modelAssessment)
 			}
 		}
 	}
+	slog.Info("gmail conversation triaged",
+		"request_id", requestIDFromContext(r.Context()),
+		"message_count", len(messages),
+		"visibility", assessment.Visibility,
+		"category", assessment.Category,
+		"ai_requested", aiRequested,
+		"ai_status", assessment.AIStatus,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 
 	writeJSON(w, http.StatusOK, threadTriageResponse{
 		Conversation: conversation,
 		Triage:       assessment,
 	})
+}
+
+type modelSelectionError struct {
+	reason observability.FailureReason
+	err    error
+}
+
+const (
+	ReasonModelSelectionFailed observability.FailureReason = "model_selection_failed"
+	ReasonOllamaUnavailable    observability.FailureReason = "ollama_unavailable"
+	ReasonNoModelsInstalled    observability.FailureReason = "no_models_installed"
+	ReasonModelNotSelected     observability.FailureReason = "model_not_selected"
+)
+
+func (e *modelSelectionError) Error() string {
+	return e.err.Error()
+}
+
+func (e *modelSelectionError) Unwrap() error {
+	return e.err
+}
+
+func (e *modelSelectionError) FailureReason() observability.FailureReason {
+	return e.reason
+}
+
+func newModelSelectionError(fallbackReason observability.FailureReason, err error) error {
+	return &modelSelectionError{
+		reason: observability.ReasonFromError(err, fallbackReason),
+		err:    err,
+	}
+}
+
+func triageFailureDetails(err error) (stage triage.FailureStage, reason observability.FailureReason) {
+	stage = triage.StageUnknown
+	reason = triage.ReasonUnknownFailure
+	var evaluationError *triage.EvaluationError
+	if !errors.As(err, &evaluationError) {
+		return stage, reason
+	}
+	return evaluationError.Stage, evaluationError.Reason
 }
 
 func (s *Server) selectedOllamaModel(ctx context.Context) (string, error) {
@@ -379,13 +479,13 @@ func (s *Server) selectedOllamaModel(ctx context.Context) (string, error) {
 	}
 	models, err := s.ollama.InstalledModels(ctx)
 	if err != nil {
-		return "", err
+		return "", newModelSelectionError(ReasonOllamaUnavailable, err)
 	}
 	if len(models) == 0 {
-		return "", fmt.Errorf("no Ollama model is installed")
+		return "", newModelSelectionError(ReasonNoModelsInstalled, fmt.Errorf("no Ollama model is installed"))
 	}
 	if len(models) > 1 {
-		return "", fmt.Errorf("OLLAMA_MODEL is required when multiple models are installed")
+		return "", newModelSelectionError(ReasonModelNotSelected, fmt.Errorf("OLLAMA_MODEL is required when multiple models are installed"))
 	}
 	return models[0].Name, nil
 }
@@ -395,6 +495,7 @@ func (s *Server) handleGmailDisconnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "disconnect_failed", "Could not remove Gmail authorization from Keychain.")
 		return
 	}
+	slog.Info("gmail disconnected", "request_id", requestIDFromContext(r.Context()))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -406,14 +507,26 @@ func (s *Server) validCredential(ctx context.Context) (credentials.OAuthCredenti
 	if credential.AccessToken != "" && time.Until(credential.Expiry) > time.Minute {
 		return credential, nil
 	}
+	startedAt := time.Now()
+	slog.Info("gmail credential refresh started", "request_id", requestIDFromContext(ctx))
 	credential, err = s.oauth.Refresh(ctx, credential)
 	if err != nil {
+		slog.Warn("gmail credential refresh completed",
+			"request_id", requestIDFromContext(ctx),
+			"outcome", "error",
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		)
 		return credentials.OAuthCredential{}, err
 	}
 	// Google does not rotate the refresh token in a normal access-token refresh.
 	// Keep the short-lived access token in memory so routine refreshes do not
 	// trigger another macOS Keychain authorization dialog.
 	s.store.Cache(credential)
+	slog.Info("gmail credential refresh completed",
+		"request_id", requestIDFromContext(ctx),
+		"outcome", "success",
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 	return credential, nil
 }
 
@@ -473,6 +586,65 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *responseRecorder) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseRecorder) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	written, err := w.ResponseWriter.Write(body)
+	w.bytes += written
+	return written, err
+}
+
+func (w *responseRecorder) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (s *Server) requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID, err := randomURLToken(12)
+		if err != nil {
+			requestID = "unavailable"
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		request := r.WithContext(observability.WithRequestID(r.Context(), requestID))
+		recorder := &responseRecorder{ResponseWriter: w}
+		startedAt := time.Now()
+
+		next.ServeHTTP(recorder, request)
+
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		route := request.Pattern
+		if route == "" {
+			route = "unmatched"
+		}
+		slog.Info("api request completed",
+			"request_id", requestID,
+			"method", request.Method,
+			"route", route,
+			"status", status,
+			"response_bytes", recorder.bytes,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		)
+	})
+}
+
 func (s *Server) validOrigin(origin string) bool {
 	if origin == "" {
 		return false
@@ -496,6 +668,11 @@ func (s *Server) redirectWithResult(w http.ResponseWriter, r *http.Request, resu
 	if sessionID != "" {
 		setSessionCookie(w, sessionID, time.Now().Add(12*time.Hour))
 	}
+	slog.Info("gmail authorization completed",
+		"request_id", requestIDFromContext(r.Context()),
+		"result", result,
+		"code", code,
+	)
 	http.Redirect(w, r, destination.String(), http.StatusFound)
 }
 
@@ -517,6 +694,10 @@ type sessionContextKey struct{}
 func sessionIDFromContext(ctx context.Context) string {
 	value, _ := ctx.Value(sessionContextKey{}).(string)
 	return value
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	return observability.RequestID(ctx)
 }
 
 func setSessionCookie(w http.ResponseWriter, value string, expiresAt time.Time) {

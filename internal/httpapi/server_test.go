@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,8 @@ import (
 
 	"local-email-workspace/internal/config"
 	"local-email-workspace/internal/credentials"
+	"local-email-workspace/internal/ollama"
+	"local-email-workspace/internal/triage"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -217,6 +221,11 @@ func TestGmailThreadTriageAppliesSuggestedFloorToGmailImportant(t *testing.T) {
 }
 
 func TestGmailThreadTriageSkipsOllamaForPoliticalBulkMail(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	body := base64.RawURLEncoding.EncodeToString([]byte("Campaign update: can you chip in by midnight?"))
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Path == "/api/generate" {
@@ -278,6 +287,38 @@ func TestGmailThreadTriageSkipsOllamaForPoliticalBulkMail(t *testing.T) {
 		!strings.Contains(responseBody, `"aiStatus":"rules"`) {
 		t.Fatalf("body = %s", responseBody)
 	}
+	logged := logs.String()
+	if !strings.Contains(logged, `"msg":"gmail triage resolved by rules"`) ||
+		!strings.Contains(logged, `"needs_ai":false`) ||
+		!strings.Contains(logged, `"reason_codes":["political_campaign","bulk_sender"]`) {
+		t.Fatalf("log = %s", logged)
+	}
+}
+
+func TestTriageFailureDetailsReportsSpecificGenerationReason(t *testing.T) {
+	err := &triage.EvaluationError{
+		Stage:  triage.StageModelGeneration,
+		Reason: ollama.ReasonRequestTimeout,
+		Err:    errors.New("request timed out"),
+	}
+
+	stage, reason := triageFailureDetails(err)
+	if stage != triage.StageModelGeneration || reason != ollama.ReasonRequestTimeout {
+		t.Fatalf("stage, reason = %q, %q", stage, reason)
+	}
+}
+
+func TestTriageFailureDetailsReportsSpecificValidationReason(t *testing.T) {
+	err := &triage.EvaluationError{
+		Stage:  triage.StageResponseValidation,
+		Reason: triage.ReasonUnknownCitation,
+		Err:    errors.New("triage cited an unknown message alias"),
+	}
+
+	stage, reason := triageFailureDetails(err)
+	if stage != triage.StageResponseValidation || reason != triage.ReasonUnknownCitation {
+		t.Fatalf("stage, reason = %q, %q", stage, reason)
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -314,6 +355,32 @@ func TestHealthReportsGmailConfiguration(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingUsesRoutePatternAndOmitsQueryValues(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	server := newTestServer(t)
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/health?token=do-not-log", nil)
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Header().Get("X-Request-ID") == "" {
+		t.Fatal("X-Request-ID header is empty")
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, `"msg":"api request completed"`) ||
+		!strings.Contains(logged, `"route":"GET /api/v1/health"`) ||
+		!strings.Contains(logged, `"status":200`) {
+		t.Fatalf("log = %s", logged)
+	}
+	if strings.Contains(logged, "do-not-log") || strings.Contains(logged, "token=") {
+		t.Fatalf("log contains query data: %s", logged)
+	}
+}
+
 func TestSessionRejectsUnexpectedOrigin(t *testing.T) {
 	server := newTestServer(t)
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/api/v1/session", nil)
@@ -341,5 +408,31 @@ func TestSessionCreatesHTTPOnlyStrictCookie(t *testing.T) {
 	cookies := response.Result().Cookies()
 	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
 		t.Fatalf("cookies = %#v", cookies)
+	}
+}
+
+func TestSessionReusesValidSessionCookie(t *testing.T) {
+	server := newTestServer(t)
+	cookie := createTestSession(t, server)
+
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/api/v1/session", nil)
+	request.Header.Set("Origin", "http://127.0.0.1:5173")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Value != cookie.Value {
+		t.Fatalf("cookies = %#v, want reused session", cookies)
+	}
+	server.mu.RLock()
+	sessionCount := len(server.sessions)
+	server.mu.RUnlock()
+	if sessionCount != 1 {
+		t.Fatalf("session count = %d, want 1", sessionCount)
 	}
 }

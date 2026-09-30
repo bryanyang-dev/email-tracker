@@ -3,6 +3,7 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -51,8 +52,13 @@ func TestInstalledModelsRejectsUnexpectedStatus(t *testing.T) {
 	})}
 
 	client := NewClient("http://127.0.0.1:11434", httpClient)
-	if _, err := client.InstalledModels(context.Background()); err == nil {
+	_, err := client.InstalledModels(context.Background())
+	if err == nil {
 		t.Fatal("InstalledModels() succeeded for a non-200 response")
+	}
+	var failure *clientFailure
+	if !errors.As(err, &failure) || failure.FailureReason() != ReasonUpstreamHTTPError {
+		t.Fatalf("failure = %#v", err)
 	}
 }
 

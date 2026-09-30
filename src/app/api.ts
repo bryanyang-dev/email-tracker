@@ -135,8 +135,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+let pendingLocalSession: Promise<{ status: string }> | undefined;
+
 export function createLocalSession(): Promise<{ status: string }> {
-  return request("/api/v1/session", { method: "POST" });
+  if (pendingLocalSession) return pendingLocalSession;
+
+  const attempt = request<{ status: string }>("/api/v1/session", { method: "POST" });
+  pendingLocalSession = attempt;
+  void attempt.then(
+    () => {
+      if (pendingLocalSession === attempt) pendingLocalSession = undefined;
+    },
+    () => {
+      if (pendingLocalSession === attempt) pendingLocalSession = undefined;
+    },
+  );
+  return attempt;
 }
 
 export function gmailConnectionStatus(): Promise<GmailConnectionStatus> {

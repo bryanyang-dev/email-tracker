@@ -2,13 +2,17 @@ package triage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"local-email-workspace/internal/observability"
 )
 
 type fakeGenerator struct {
 	response []byte
 	prompt   string
+	err      error
 }
 
 func (generator *fakeGenerator) GenerateStructured(
@@ -17,7 +21,36 @@ func (generator *fakeGenerator) GenerateStructured(
 	_ any,
 ) ([]byte, error) {
 	generator.prompt = prompt
-	return generator.response, nil
+	return generator.response, generator.err
+}
+
+func TestEvaluationErrorIncludesReasonForEveryStage(t *testing.T) {
+	tests := []struct {
+		stage    FailureStage
+		fallback observability.FailureReason
+		cause    error
+		want     observability.FailureReason
+	}{
+		{StageInputProjection, ReasonInputProjectionFailed, newReasonError(ReasonNoMessages, "no messages"), ReasonNoMessages},
+		{StageSchemaEncoding, ReasonSchemaEncodingFailed, errors.New("encode schema"), ReasonSchemaEncodingFailed},
+		{StageInputEncoding, ReasonInputEncodingFailed, errors.New("encode input"), ReasonInputEncodingFailed},
+		{StageModelGeneration, ReasonGeneratorFailed, newReasonError(observability.FailureReason("request_timeout"), "request timeout"), observability.FailureReason("request_timeout")},
+		{StageResponseDecoding, ReasonResponseDecodingFailed, newReasonError(ReasonInvalidResponseJSON, "invalid JSON"), ReasonInvalidResponseJSON},
+		{StageResponseValidation, ReasonResponseValidationFailed, newReasonError(ReasonInvalidCategory, "invalid category"), ReasonInvalidCategory},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.stage), func(t *testing.T) {
+			err := evaluationError(test.stage, test.fallback, test.cause)
+			var evaluationError *EvaluationError
+			if !errors.As(err, &evaluationError) {
+				t.Fatalf("error type = %T, want *EvaluationError", err)
+			}
+			if evaluationError.Stage != test.stage || evaluationError.Reason != test.want {
+				t.Fatalf("stage, reason = %q, %q", evaluationError.Stage, evaluationError.Reason)
+			}
+		})
+	}
 }
 
 func TestEvaluateValidatesAndMapsMessageAliases(t *testing.T) {
@@ -61,8 +94,13 @@ func TestEvaluateRejectsUnknownCitation(t *testing.T) {
 	}`)}
 	service := NewService(generator)
 
-	if _, err := service.Evaluate(context.Background(), "model", []Message{{ID: "message-1"}}); err == nil {
+	_, err := service.Evaluate(context.Background(), "model", []Message{{ID: "message-1"}})
+	if err == nil {
 		t.Fatal("Evaluate() accepted an unknown citation")
+	}
+	var evaluationError *EvaluationError
+	if !errors.As(err, &evaluationError) || evaluationError.Reason != "unknown_citation" {
+		t.Fatalf("validation error = %#v", err)
 	}
 }
 
@@ -79,6 +117,28 @@ func TestEvaluateRejectsMissingRequiredBoolean(t *testing.T) {
 
 	if _, err := service.Evaluate(context.Background(), "model", []Message{{ID: "message-1"}}); err == nil {
 		t.Fatal("Evaluate() accepted a missing required boolean")
+	}
+}
+
+func TestEvaluateAllowsLowValueActiveForPolicyNormalization(t *testing.T) {
+	generator := &fakeGenerator{response: []byte(`{
+		"visibility":"active",
+		"category":"newsletter",
+		"needs_action":false,
+		"urgent":false,
+		"confidence":0.99,
+		"reason_codes":["newsletter"],
+		"source_message_ids":["m1"]
+	}`)}
+	service := NewService(generator)
+
+	assessment, err := service.Evaluate(context.Background(), "model", []Message{{ID: "message-1"}})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	result := ApplyPolicy(Assessment{Visibility: VisibilityAll}, assessment)
+	if result.Visibility != VisibilityAll {
+		t.Fatalf("visibility = %q, want %q", result.Visibility, VisibilityAll)
 	}
 }
 
@@ -175,5 +235,39 @@ func TestPolicyKeepsLowConfidenceSuppressionSuggested(t *testing.T) {
 	result := ApplyPolicy(baseline, model)
 	if result.Visibility != VisibilitySuggested {
 		t.Fatalf("visibility = %q", result.Visibility)
+	}
+}
+
+func TestPolicyDowngradesLowValueActiveWithoutAction(t *testing.T) {
+	baseline := Assessment{Visibility: VisibilityAll}
+	model := Assessment{
+		Visibility:  VisibilityActive,
+		Category:    "newsletter",
+		Confidence:  0.99,
+		NeedsAction: false,
+		Urgent:      false,
+		AIStatus:    "applied",
+	}
+
+	result := ApplyPolicy(baseline, model)
+	if result.Visibility != VisibilityAll {
+		t.Fatalf("visibility = %q, want %q", result.Visibility, VisibilityAll)
+	}
+}
+
+func TestPolicyKeepsLowValueActiveWithAction(t *testing.T) {
+	baseline := Assessment{Visibility: VisibilityAll}
+	model := Assessment{
+		Visibility:  VisibilityActive,
+		Category:    "newsletter",
+		Confidence:  0.99,
+		NeedsAction: true,
+		Urgent:      false,
+		AIStatus:    "applied",
+	}
+
+	result := ApplyPolicy(baseline, model)
+	if result.Visibility != VisibilityActive {
+		t.Fatalf("visibility = %q, want %q", result.Visibility, VisibilityActive)
 	}
 }

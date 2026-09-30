@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"local-email-workspace/internal/credentials"
+	"local-email-workspace/internal/observability"
 )
 
 const (
@@ -71,7 +73,7 @@ func (c *OAuthClient) Exchange(ctx context.Context, code, verifier string) (cred
 		values.Set("client_secret", c.clientSecret)
 	}
 
-	response, err := c.postToken(ctx, values)
+	response, err := c.postToken(ctx, values, "exchange")
 	if err != nil {
 		return credentials.OAuthCredential{}, err
 	}
@@ -94,7 +96,7 @@ func (c *OAuthClient) Refresh(ctx context.Context, current credentials.OAuthCred
 		values.Set("client_secret", c.clientSecret)
 	}
 
-	response, err := c.postToken(ctx, values)
+	response, err := c.postToken(ctx, values, "refresh")
 	if err != nil {
 		return credentials.OAuthCredential{}, err
 	}
@@ -107,32 +109,53 @@ func (c *OAuthClient) Refresh(ctx context.Context, current credentials.OAuthCred
 	return refreshed, nil
 }
 
-func (c *OAuthClient) postToken(ctx context.Context, values url.Values) (tokenResponse, error) {
+func (c *OAuthClient) postToken(ctx context.Context, values url.Values, operation string) (tokenResponse, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, googleTokenEndpoint, strings.NewReader(values.Encode()))
 	if err != nil {
 		return tokenResponse{}, fmt.Errorf("create token request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+	startedAt := time.Now()
 	response, err := c.httpClient.Do(request)
 	if err != nil {
+		logOutboundCall(ctx, "google_oauth", operation, http.MethodPost, 0, "error", startedAt)
 		return tokenResponse{}, fmt.Errorf("request token: %w", err)
 	}
-	defer response.Body.Close()
+	outcome := "success"
+	defer func() {
+		response.Body.Close()
+		logOutboundCall(ctx, "google_oauth", operation, http.MethodPost, response.StatusCode, outcome, startedAt)
+	}()
 
 	if response.StatusCode != http.StatusOK {
+		outcome = "error"
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
 		return tokenResponse{}, fmt.Errorf("token endpoint returned %s: %s", response.Status, strings.TrimSpace(string(body)))
 	}
 
 	var token tokenResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil {
+		outcome = "error"
 		return tokenResponse{}, fmt.Errorf("decode token response: %w", err)
 	}
 	if token.AccessToken == "" {
+		outcome = "error"
 		return tokenResponse{}, fmt.Errorf("token response did not contain an access token")
 	}
 	return token, nil
+}
+
+func logOutboundCall(ctx context.Context, service, operation, method string, status int, outcome string, startedAt time.Time) {
+	slog.Info("outbound api call completed",
+		"request_id", observability.RequestID(ctx),
+		"service", service,
+		"operation", operation,
+		"method", method,
+		"status", status,
+		"outcome", outcome,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 }
 
 func credentialFromToken(token tokenResponse) credentials.OAuthCredential {

@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"local-email-workspace/internal/observability"
 )
 
 const (
@@ -21,11 +23,49 @@ const (
 )
 
 type Visibility string
+type FailureStage string
 
 const (
 	VisibilityAll       Visibility = "all"
 	VisibilitySuggested Visibility = "suggested"
 	VisibilityActive    Visibility = "active"
+)
+
+const (
+	StageUnknown            FailureStage = "unknown"
+	StageModelSelection     FailureStage = "model_selection"
+	StageInputProjection    FailureStage = "input_projection"
+	StageSchemaEncoding     FailureStage = "schema_encoding"
+	StageInputEncoding      FailureStage = "input_encoding"
+	StageModelGeneration    FailureStage = "model_generation"
+	StageResponseDecoding   FailureStage = "response_decoding"
+	StageResponseValidation FailureStage = "response_validation"
+)
+
+const (
+	ReasonUnknownFailure            observability.FailureReason = "unknown_failure"
+	ReasonInputProjectionFailed     observability.FailureReason = "input_projection_failed"
+	ReasonSchemaEncodingFailed      observability.FailureReason = "schema_encoding_failed"
+	ReasonInputEncodingFailed       observability.FailureReason = "input_encoding_failed"
+	ReasonGeneratorFailed           observability.FailureReason = "generator_failed"
+	ReasonResponseDecodingFailed    observability.FailureReason = "response_decoding_failed"
+	ReasonResponseValidationFailed  observability.FailureReason = "response_validation_failed"
+	ReasonNoMessages                observability.FailureReason = "no_messages"
+	ReasonInvalidResponseJSON       observability.FailureReason = "invalid_response_json"
+	ReasonTrailingResponseContent   observability.FailureReason = "trailing_response_content"
+	ReasonInvalidVisibility         observability.FailureReason = "invalid_visibility"
+	ReasonInvalidCategory           observability.FailureReason = "invalid_category"
+	ReasonMissingRequiredScalar     observability.FailureReason = "missing_required_scalar"
+	ReasonConfidenceOutOfRange      observability.FailureReason = "confidence_out_of_range"
+	ReasonInvalidReasonCount        observability.FailureReason = "invalid_reason_count"
+	ReasonDuplicateReasonCodes      observability.FailureReason = "duplicate_reason_codes"
+	ReasonInvalidReasonCode         observability.FailureReason = "invalid_reason_code"
+	ReasonInvalidCitationCount      observability.FailureReason = "invalid_citation_count"
+	ReasonDuplicateCitations        observability.FailureReason = "duplicate_citations"
+	ReasonUnknownCitation           observability.FailureReason = "unknown_citation"
+	ReasonHiddenActionableMail      observability.FailureReason = "hidden_actionable_mail"
+	ReasonActionRequiredWithoutFlag observability.FailureReason = "action_required_without_flag"
+	ReasonUrgentWithoutFlag         observability.FailureReason = "urgent_without_flag"
 )
 
 type Message struct {
@@ -64,6 +104,49 @@ type StructuredGenerator interface {
 
 type Service struct {
 	generator StructuredGenerator
+}
+
+type EvaluationError struct {
+	Stage  FailureStage
+	Reason observability.FailureReason
+	Err    error
+}
+
+type reasonError struct {
+	reason observability.FailureReason
+	err    error
+}
+
+func (e *EvaluationError) Error() string {
+	return fmt.Sprintf("triage %s (%s): %v", e.Stage, e.Reason, e.Err)
+}
+
+func (e *EvaluationError) Unwrap() error {
+	return e.Err
+}
+
+func (e *reasonError) Error() string {
+	return e.err.Error()
+}
+
+func (e *reasonError) Unwrap() error {
+	return e.err
+}
+
+func (e *reasonError) FailureReason() observability.FailureReason {
+	return e.reason
+}
+
+func newReasonError(reason observability.FailureReason, message string, args ...any) error {
+	return &reasonError{reason: reason, err: fmt.Errorf(message, args...)}
+}
+
+func evaluationError(stage FailureStage, fallbackReason observability.FailureReason, err error) error {
+	return &EvaluationError{
+		Stage:  stage,
+		Reason: observability.ReasonFromError(err, fallbackReason),
+		Err:    err,
+	}
 }
 
 func NewService(generator StructuredGenerator) *Service {
@@ -184,32 +267,32 @@ Use active only when the user has a real obligation, risk, decision, or time-sen
 func (s *Service) Evaluate(ctx context.Context, model string, messages []Message) (Assessment, error) {
 	promptMessages, aliases, err := projectMessages(messages)
 	if err != nil {
-		return Assessment{}, err
+		return Assessment{}, evaluationError(StageInputProjection, ReasonInputProjectionFailed, err)
 	}
 	schemaJSON, err := json.Marshal(outputSchema)
 	if err != nil {
-		return Assessment{}, fmt.Errorf("encode triage schema: %w", err)
+		return Assessment{}, evaluationError(StageSchemaEncoding, ReasonSchemaEncodingFailed, err)
 	}
 	envelope, err := json.Marshal(map[string]any{
 		"task":                 "email_visibility_triage_v1",
 		"UNTRUSTED_EMAIL_DATA": promptMessages,
 	})
 	if err != nil {
-		return Assessment{}, fmt.Errorf("encode triage input: %w", err)
+		return Assessment{}, evaluationError(StageInputEncoding, ReasonInputEncodingFailed, err)
 	}
 	prompt := "Classify the conversation using this exact JSON schema:\n" + string(schemaJSON) +
 		"\n\nInput envelope:\n" + string(envelope)
 
 	raw, err := s.generator.GenerateStructured(ctx, model, systemPrompt, prompt, outputSchema)
 	if err != nil {
-		return Assessment{}, err
+		return Assessment{}, evaluationError(StageModelGeneration, ReasonGeneratorFailed, err)
 	}
 	result, err := decodeModelAssessment(raw)
 	if err != nil {
-		return Assessment{}, err
+		return Assessment{}, evaluationError(StageResponseDecoding, ReasonResponseDecodingFailed, err)
 	}
 	if err := validateModelAssessment(result, aliases); err != nil {
-		return Assessment{}, err
+		return Assessment{}, evaluationError(StageResponseValidation, ReasonResponseValidationFailed, err)
 	}
 
 	sourceIDs := make([]string, 0, len(result.Citations))
@@ -297,6 +380,13 @@ func Baseline(messages []Message, accountEmail string) Assessment {
 
 func ApplyPolicy(baseline, model Assessment) Assessment {
 	result := model
+	result.NeedsAction = result.NeedsAction || baseline.NeedsAction
+	result.Urgent = result.Urgent || baseline.Urgent
+	if result.Visibility == VisibilityActive &&
+		isLowValueCategory(result.Category) &&
+		!result.NeedsAction && !result.Urgent {
+		result.Visibility = VisibilityAll
+	}
 	if result.Confidence < 0.65 && result.Visibility == VisibilityActive {
 		result.Visibility = VisibilitySuggested
 	}
@@ -311,14 +401,29 @@ func ApplyPolicy(baseline, model Assessment) Assessment {
 		result.ReasonCodes = uniqueBounded(append(result.ReasonCodes, baseline.ReasonCodes...), maxReasonCodes)
 		result.SourceMessageIDs = uniqueBounded(append(result.SourceMessageIDs, baseline.SourceMessageIDs...), maxCitations)
 	}
-	result.NeedsAction = result.NeedsAction || baseline.NeedsAction
-	result.Urgent = result.Urgent || baseline.Urgent
 	return result
+}
+
+func isLowValueCategory(category string) bool {
+	switch category {
+	case "newsletter",
+		"promotion",
+		"political_campaign",
+		"fundraising",
+		"petition",
+		"survey",
+		"social_engagement",
+		"engagement_bait",
+		"automated":
+		return true
+	default:
+		return false
+	}
 }
 
 func projectMessages(messages []Message) ([]promptMessage, map[string]string, error) {
 	if len(messages) == 0 {
-		return nil, nil, fmt.Errorf("triage requires at least one message")
+		return nil, nil, newReasonError(ReasonNoMessages, "triage requires at least one message")
 	}
 	if len(messages) > maxMessages {
 		messages = messages[len(messages)-maxMessages:]
@@ -356,72 +461,57 @@ func decodeModelAssessment(raw []byte) (modelAssessment, error) {
 	decoder.DisallowUnknownFields()
 	var result modelAssessment
 	if err := decoder.Decode(&result); err != nil {
-		return modelAssessment{}, fmt.Errorf("decode triage result: %w", err)
+		return modelAssessment{}, newReasonError(ReasonInvalidResponseJSON, "decode triage result: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return modelAssessment{}, fmt.Errorf("decode triage result: trailing content")
+		return modelAssessment{}, newReasonError(ReasonTrailingResponseContent, "decode triage result: trailing content")
 	}
 	return result, nil
 }
 
 func validateModelAssessment(result modelAssessment, aliases map[string]string) error {
 	if visibilityRank(result.Visibility) < 0 {
-		return fmt.Errorf("invalid triage visibility %q", result.Visibility)
+		return newReasonError(ReasonInvalidVisibility, "invalid triage visibility %q", result.Visibility)
 	}
 	if !slices.Contains(categories, result.Category) {
-		return fmt.Errorf("invalid triage category %q", result.Category)
+		return newReasonError(ReasonInvalidCategory, "invalid triage category %q", result.Category)
 	}
 	if result.NeedsAction == nil || result.Urgent == nil || result.Confidence == nil {
-		return fmt.Errorf("triage result omitted a required scalar field")
+		return newReasonError(ReasonMissingRequiredScalar, "triage result omitted a required scalar field")
 	}
 	if *result.Confidence < 0 || *result.Confidence > 1 {
-		return fmt.Errorf("triage confidence is out of range")
+		return newReasonError(ReasonConfidenceOutOfRange, "triage confidence is out of range")
 	}
 	if len(result.ReasonCodes) == 0 || len(result.ReasonCodes) > maxReasonCodes {
-		return fmt.Errorf("triage reason count is invalid")
+		return newReasonError(ReasonInvalidReasonCount, "triage reason count is invalid")
 	}
 	if len(uniqueBounded(result.ReasonCodes, maxReasonCodes)) != len(result.ReasonCodes) {
-		return fmt.Errorf("triage reasons must be unique")
+		return newReasonError(ReasonDuplicateReasonCodes, "triage reasons must be unique")
 	}
 	for _, reason := range result.ReasonCodes {
 		if !slices.Contains(reasonCodes, reason) {
-			return fmt.Errorf("invalid triage reason %q", reason)
+			return newReasonError(ReasonInvalidReasonCode, "invalid triage reason %q", reason)
 		}
 	}
 	if len(result.Citations) == 0 || len(result.Citations) > maxCitations {
-		return fmt.Errorf("triage citation count is invalid")
+		return newReasonError(ReasonInvalidCitationCount, "triage citation count is invalid")
 	}
 	if len(uniqueBounded(result.Citations, maxCitations)) != len(result.Citations) {
-		return fmt.Errorf("triage citations must be unique")
+		return newReasonError(ReasonDuplicateCitations, "triage citations must be unique")
 	}
 	for _, alias := range result.Citations {
 		if _, found := aliases[alias]; !found {
-			return fmt.Errorf("triage cited unknown message alias %q", alias)
+			return newReasonError(ReasonUnknownCitation, "triage cited unknown message alias %q", alias)
 		}
 	}
 	if result.Visibility == VisibilityAll && (*result.NeedsAction || *result.Urgent) {
-		return fmt.Errorf("triage cannot hide urgent or actionable mail")
+		return newReasonError(ReasonHiddenActionableMail, "triage cannot hide urgent or actionable mail")
 	}
 	if result.Category == "action_required" && !*result.NeedsAction {
-		return fmt.Errorf("action-required triage must set needs_action")
+		return newReasonError(ReasonActionRequiredWithoutFlag, "action-required triage must set needs_action")
 	}
 	if result.Category == "urgent" && !*result.Urgent {
-		return fmt.Errorf("urgent triage must set urgent")
-	}
-	if result.Visibility == VisibilityActive &&
-		slices.Contains([]string{
-			"newsletter",
-			"promotion",
-			"political_campaign",
-			"fundraising",
-			"petition",
-			"survey",
-			"social_engagement",
-			"engagement_bait",
-			"automated",
-		}, result.Category) &&
-		!*result.NeedsAction && !*result.Urgent {
-		return fmt.Errorf("low-value category cannot be active without urgency or action")
+		return newReasonError(ReasonUrgentWithoutFlag, "urgent triage must set urgent")
 	}
 	return nil
 }

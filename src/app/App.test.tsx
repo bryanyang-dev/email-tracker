@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
@@ -8,9 +9,13 @@ describe("App", () => {
   });
 
   it("loads Gmail inbox messages into the active workspace", async () => {
+    let sessionRequests = 0;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
-      if (path === "/api/v1/session") return jsonResponse({ status: "ready" }, 201);
+      if (path === "/api/v1/session") {
+        sessionRequests += 1;
+        return jsonResponse({ status: "ready" }, 201);
+      }
       if (path === "/api/v1/auth/gmail/status") {
         return jsonResponse({ configured: true, connected: true, emailAddress: "person@example.com" });
       }
@@ -169,7 +174,11 @@ describe("App", () => {
       return jsonResponse({}, 500);
     }));
 
-    render(<App />);
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
 
     expect(screen.getByRole("heading", { name: "Active" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Vendor renewal" })).toBeInTheDocument();
@@ -190,6 +199,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Previous" }));
     expect(await screen.findByRole("heading", { name: "Vendor renewal" })).toBeInTheDocument();
     expect(screen.getByText("Page 1")).toBeInTheDocument();
+    expect(sessionRequests).toBe(1);
   });
 });
 
