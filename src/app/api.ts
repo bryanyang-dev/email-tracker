@@ -100,8 +100,10 @@ export function beginGmailAuthorization(): Promise<GmailAuthorization> {
   return request("/api/v1/auth/gmail/start", { method: "POST" });
 }
 
-export function loadGmailInbox(): Promise<GmailInboxPage> {
-  return request("/api/v1/gmail/messages?limit=25");
+export function loadGmailInbox(pageToken = ""): Promise<GmailInboxPage> {
+  const query = new URLSearchParams({ limit: "5" });
+  if (pageToken) query.set("pageToken", pageToken);
+  return request(`/api/v1/gmail/messages?${query.toString()}`);
 }
 
 export function ollamaStatus(): Promise<OllamaStatus> {

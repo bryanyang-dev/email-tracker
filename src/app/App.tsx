@@ -31,6 +31,9 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
   const [selectedId, setSelectedId] = useState("");
+  const [pageIndex, setPageIndex] = useState(0);
+  const [pageTokens, setPageTokens] = useState<string[]>([""]);
+  const [nextPageToken, setNextPageToken] = useState("");
   const threads = useMemo(() => threadsForView(view, allThreads), [view, allThreads]);
   const selected =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
@@ -62,7 +65,7 @@ export function App() {
         return;
       }
       setConnection({ status: "connected", emailAddress: status.emailAddress ?? "Gmail" });
-      await refreshInbox();
+      await loadInboxPage(0, "");
     } catch (error) {
       setConnection({ status: "offline", message: errorMessage(error) });
     }
@@ -81,12 +84,14 @@ export function App() {
     }
   }
 
-  async function refreshInbox() {
+  async function loadInboxPage(nextPageIndex: number, pageToken: string) {
     setInboxLoading(true);
     try {
-      const inbox = await loadGmailInbox();
+      const inbox = await loadGmailInbox(pageToken);
       const nextThreads = inbox.messages.map(messageToThread);
       setAllThreads(nextThreads);
+      setPageIndex(nextPageIndex);
+      setNextPageToken(inbox.nextPageToken ?? "");
       setSelectedId((current) =>
         nextThreads.some((thread) => thread.id === current) ? current : (nextThreads[0]?.id ?? ""),
       );
@@ -96,6 +101,28 @@ export function App() {
     } finally {
       setInboxLoading(false);
     }
+  }
+
+  function refreshInbox() {
+    void loadInboxPage(pageIndex, pageTokens[pageIndex] ?? "");
+  }
+
+  function showNextPage() {
+    if (!nextPageToken || inboxLoading) return;
+    const targetIndex = pageIndex + 1;
+    const targetToken = nextPageToken;
+    setPageTokens((current) => {
+      const next = current.slice(0, targetIndex);
+      next[targetIndex] = targetToken;
+      return next;
+    });
+    void loadInboxPage(targetIndex, targetToken);
+  }
+
+  function showPreviousPage() {
+    if (pageIndex === 0 || inboxLoading) return;
+    const targetIndex = pageIndex - 1;
+    void loadInboxPage(targetIndex, pageTokens[targetIndex] ?? "");
   }
 
   async function connectGmail() {
@@ -196,7 +223,7 @@ export function App() {
             type="button"
             aria-label="Refresh threads"
             disabled={connection.status !== "connected" || inboxLoading}
-            onClick={() => void refreshInbox()}
+            onClick={refreshInbox}
           >
             ↻
           </button>
@@ -206,7 +233,7 @@ export function App() {
 
         <ConnectionBanner connection={connection} inboxLoading={inboxLoading} />
 
-        <div className="thread-items">
+        <div className={threads.length ? "thread-items paginated" : "thread-items"}>
           {connection.status !== "connected" ? (
             <ConnectionCard connection={connection} onConnect={() => void connectGmail()} />
           ) : threads.length === 0 ? (
@@ -240,6 +267,26 @@ export function App() {
             ))
           )}
         </div>
+
+        {connection.status === "connected" && (
+          <nav className="pagination" aria-label="Inbox pages">
+            <button
+              type="button"
+              disabled={pageIndex === 0 || inboxLoading}
+              onClick={showPreviousPage}
+            >
+              Previous
+            </button>
+            <span aria-live="polite">Page {pageIndex + 1}</span>
+            <button
+              type="button"
+              disabled={!nextPageToken || inboxLoading}
+              onClick={showNextPage}
+            >
+              Next
+            </button>
+          </nav>
+        )}
       </section>
 
       <section className="thread-detail" aria-label="Selected thread">

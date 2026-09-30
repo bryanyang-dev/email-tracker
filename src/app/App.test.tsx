@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
@@ -20,7 +20,7 @@ describe("App", () => {
           models: [{ name: "llama3.2:3b", parameterSize: "3.2B", size: 2019393189 }],
         });
       }
-      if (path === "/api/v1/gmail/messages?limit=25") {
+      if (path === "/api/v1/gmail/messages?limit=5") {
         return jsonResponse({
           messages: [
             {
@@ -36,7 +36,27 @@ describe("App", () => {
               internalAt: "1790683200000",
             },
           ],
-          resultSize: 1,
+          nextPageToken: "next-page-token",
+          resultSize: 2,
+        });
+      }
+      if (path === "/api/v1/gmail/messages?limit=5&pageToken=next-page-token") {
+        return jsonResponse({
+          messages: [
+            {
+              id: "message-2",
+              threadId: "thread-2",
+              subject: "Planning update",
+              from: "Alex Kim <alex@example.com>",
+              to: "person@example.com",
+              date: "Tue, 29 Sep 2026 11:00:00 -0400",
+              snippet: "The revised schedule is ready.",
+              unread: false,
+              labelIds: ["INBOX"],
+              internalAt: "1790686800000",
+            },
+          ],
+          resultSize: 2,
         });
       }
       return jsonResponse({}, 500);
@@ -49,6 +69,13 @@ describe("App", () => {
     expect(screen.getByText("Connected as person@example.com")).toBeInTheDocument();
     expect(screen.getByText("Local AI ready")).toBeInTheDocument();
     expect(screen.getByText("llama3.2:3b")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByRole("heading", { name: "Planning update" })).toBeInTheDocument();
+    expect(screen.getByText("Page 2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+    expect(await screen.findByRole("heading", { name: "Vendor renewal" })).toBeInTheDocument();
+    expect(screen.getByText("Page 1")).toBeInTheDocument();
   });
 });
 
