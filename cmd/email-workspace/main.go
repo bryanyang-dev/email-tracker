@@ -64,7 +64,7 @@ func run() error {
 		}
 	}
 
-	api := httpapi.New(cfg, credentialStore, outboundClient)
+	api := httpapi.NewWithRepository(cfg, credentialStore, outboundClient, database)
 	server := &http.Server{
 		Addr:              cfg.Address,
 		Handler:           api.Handler(),

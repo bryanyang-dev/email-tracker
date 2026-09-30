@@ -13,14 +13,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
 	"local-email-workspace/internal/config"
+	"local-email-workspace/internal/conversations"
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/googleapi"
+	"local-email-workspace/internal/mailsync"
 	"local-email-workspace/internal/observability"
 	"local-email-workspace/internal/ollama"
+	"local-email-workspace/internal/storage"
 	"local-email-workspace/internal/triage"
 )
 
@@ -33,30 +37,48 @@ type pendingAuthorization struct {
 }
 
 type Server struct {
-	config   config.Config
-	store    credentials.Store
-	oauth    *googleapi.OAuthClient
-	gmail    *googleapi.GmailClient
-	ollama   *ollama.Client
-	triage   *triage.Service
-	mux      *http.ServeMux
-	mu       sync.RWMutex
-	sessions map[string]time.Time
-	pending  map[string]pendingAuthorization
+	config                config.Config
+	store                 credentials.Store
+	oauth                 *googleapi.OAuthClient
+	gmail                 *googleapi.GmailClient
+	ollama                *ollama.Client
+	triage                *triage.Service
+	mailSync              *mailsync.Service
+	conversationProcessor *conversations.Service
+	repository            storage.Repository
+	mux                   *http.ServeMux
+	mu                    sync.RWMutex
+	sessions              map[string]time.Time
+	pending               map[string]pendingAuthorization
 }
 
 func New(cfg config.Config, store credentials.Store, httpClient *http.Client) *Server {
+	return NewWithRepository(cfg, store, httpClient, nil)
+}
+
+func NewWithRepository(
+	cfg config.Config,
+	store credentials.Store,
+	httpClient *http.Client,
+	repository storage.Repository,
+) *Server {
 	ollamaClient := ollama.NewClient(cfg.OllamaBaseURL, httpClient)
+	gmailClient := googleapi.NewGmailClient(httpClient)
 	server := &Server{
 		config:   cfg,
 		store:    store,
 		oauth:    googleapi.NewOAuthClient(httpClient, cfg.GmailClientID, cfg.GmailClientSecret, cfg.OAuthRedirectURL),
-		gmail:    googleapi.NewGmailClient(httpClient),
+		gmail:    gmailClient,
 		ollama:   ollamaClient,
 		triage:   triage.NewService(ollamaClient),
 		mux:      http.NewServeMux(),
 		sessions: make(map[string]time.Time),
 		pending:  make(map[string]pendingAuthorization),
+	}
+	if repository != nil {
+		server.mailSync = mailsync.New(repository, gmailClient)
+		server.conversationProcessor = conversations.New(repository, gmailClient, server.triage)
+		server.repository = repository
 	}
 	server.routes()
 	return server
@@ -74,9 +96,371 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/auth/gmail/callback", s.handleGmailCallback)
 	s.mux.Handle("POST /api/v1/auth/gmail/disconnect", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleGmailDisconnect))))
 	s.mux.Handle("GET /api/v1/gmail/messages", s.authenticated(http.HandlerFunc(s.handleInbox)))
+	s.mux.Handle("GET /api/v1/gmail/sync", s.authenticated(http.HandlerFunc(s.handleGmailSyncStatus)))
+	s.mux.Handle("POST /api/v1/gmail/sync", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleGmailSync))))
 	s.mux.Handle("GET /api/v1/gmail/threads/{threadID}", s.authenticated(http.HandlerFunc(s.handleThread)))
 	s.mux.Handle("POST /api/v1/gmail/threads/{threadID}/triage", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleThreadTriage))))
+	s.mux.Handle("GET /api/v1/conversations", s.authenticated(http.HandlerFunc(s.handleWorkspaceConversations)))
+	s.mux.Handle("GET /api/v1/conversations/{conversationID}", s.authenticated(http.HandlerFunc(s.handleWorkspaceConversation)))
 	s.mux.Handle("GET /api/v1/ollama/status", s.authenticated(http.HandlerFunc(s.handleOllamaStatus)))
+}
+
+type workspaceConversationSummaryResponse struct {
+	ID              string             `json:"id"`
+	Title           string             `json:"title"`
+	State           string             `json:"state"`
+	Importance      storage.Importance `json:"importance"`
+	ImportanceScore float64            `json:"importanceScore"`
+	UpdatedAt       string             `json:"updatedAt"`
+	MessageCount    int                `json:"messageCount"`
+	Unread          bool               `json:"unread"`
+	NeedsAttention  bool               `json:"needsAttention"`
+	Participants    []string           `json:"participants"`
+	Preview         string             `json:"preview"`
+	LatestUpdate    string             `json:"latestUpdate"`
+	Category        string             `json:"category"`
+	ReasonCodes     []string           `json:"reasonCodes"`
+	AIStatus        string             `json:"aiStatus"`
+}
+
+type workspaceConversationCountsResponse struct {
+	Active    int `json:"active"`
+	Attention int `json:"attention"`
+	Suggested int `json:"suggested"`
+	Snoozed   int `json:"snoozed"`
+	Resolved  int `json:"resolved"`
+	All       int `json:"all"`
+}
+
+type workspaceConversationMessageResponse struct {
+	ID                 string   `json:"id"`
+	ThreadID           string   `json:"threadId"`
+	Subject            string   `json:"subject"`
+	From               string   `json:"from"`
+	To                 string   `json:"to"`
+	Cc                 string   `json:"cc,omitempty"`
+	Date               string   `json:"date"`
+	InternalAt         string   `json:"internalAt"`
+	LabelIDs           []string `json:"labelIds"`
+	Body               string   `json:"body"`
+	BodySource         string   `json:"bodySource"`
+	BodyTruncated      bool     `json:"bodyTruncated"`
+	SuspiciousContent  bool     `json:"suspiciousContent"`
+	HasListUnsubscribe bool     `json:"hasListUnsubscribe"`
+	HasListID          bool     `json:"hasListId"`
+	Precedence         string   `json:"precedence,omitempty"`
+	AutoSubmitted      bool     `json:"autoSubmitted"`
+	HasFeedbackID      bool     `json:"hasFeedbackId"`
+}
+
+type workspaceConversationResponse struct {
+	workspaceConversationSummaryResponse
+	Messages []workspaceConversationMessageResponse `json:"messages"`
+}
+
+func (s *Server) handleWorkspaceConversations(w http.ResponseWriter, r *http.Request) {
+	if s.repository == nil {
+		writeError(w, http.StatusServiceUnavailable, "workspace_unavailable", "Local workspace storage is unavailable.")
+		return
+	}
+	view := r.URL.Query().Get("view")
+	if view == "" {
+		view = "all"
+	}
+	if !validConversationView(view) {
+		writeError(w, http.StatusBadRequest, "invalid_conversation_view", "A valid conversation view is required.")
+		return
+	}
+	conversations, counts, err := s.repository.WorkspaceConversations(r.Context(), view)
+	if err != nil {
+		slog.Error("workspace conversation list failed", "request_id", requestIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, "conversation_list_failed", "Could not load local conversations.")
+		return
+	}
+	items := make([]workspaceConversationSummaryResponse, len(conversations))
+	for index, conversation := range conversations {
+		items[index] = workspaceConversationSummary(conversation)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"conversations": items,
+		"counts": workspaceConversationCountsResponse{
+			Active: counts.Active, Attention: counts.Attention, Suggested: counts.Suggested,
+			Snoozed: counts.Snoozed, Resolved: counts.Resolved, All: counts.All,
+		},
+	})
+}
+
+func validConversationView(view string) bool {
+	switch view {
+	case "active", "attention", "suggested", "snoozed", "resolved", "all":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleWorkspaceConversation(w http.ResponseWriter, r *http.Request) {
+	if s.repository == nil {
+		writeError(w, http.StatusServiceUnavailable, "workspace_unavailable", "Local workspace storage is unavailable.")
+		return
+	}
+	identifier := r.PathValue("conversationID")
+	if identifier == "" || len(identifier) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_conversation_id", "A valid conversation ID is required.")
+		return
+	}
+	conversation, err := s.repository.WorkspaceConversation(r.Context(), identifier)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "conversation_not_found", "The local conversation was not found.")
+		return
+	}
+	if err != nil {
+		slog.Error("workspace conversation load failed", "request_id", requestIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, "conversation_load_failed", "Could not load the local conversation.")
+		return
+	}
+	response := workspaceConversationResponse{workspaceConversationSummaryResponse: workspaceConversationSummary(conversation)}
+	response.Messages = make([]workspaceConversationMessageResponse, len(conversation.Messages))
+	for index, message := range conversation.Messages {
+		response.Messages[index] = workspaceConversationMessageResponse{
+			ID:                 message.ProviderMessageID,
+			ThreadID:           message.ProviderThreadID,
+			Subject:            message.Subject,
+			From:               message.From,
+			To:                 message.To,
+			Cc:                 message.Cc,
+			Date:               message.Date,
+			InternalAt:         strconv.FormatInt(message.InternalAt.UnixMilli(), 10),
+			LabelIDs:           message.LabelIDs,
+			Body:               message.Body,
+			BodySource:         "plain",
+			BodyTruncated:      message.BodyState == storage.BodyTruncated,
+			SuspiciousContent:  message.SuspiciousContent,
+			HasListUnsubscribe: message.HasListUnsubscribe,
+			HasListID:          message.HasListID,
+			Precedence:         message.Precedence,
+			AutoSubmitted:      message.AutoSubmitted,
+			HasFeedbackID:      message.HasFeedbackID,
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func workspaceConversationSummary(conversation storage.WorkspaceConversationProjection) workspaceConversationSummaryResponse {
+	latestUpdate := conversation.LatestBody
+	if latestUpdate == "" {
+		latestUpdate = conversation.Preview
+	}
+	return workspaceConversationSummaryResponse{
+		ID:              conversation.ID,
+		Title:           conversation.Title,
+		State:           conversation.State,
+		Importance:      conversation.Importance,
+		ImportanceScore: conversation.ImportanceScore,
+		UpdatedAt:       conversation.LastMessageAt.Format(time.RFC3339),
+		MessageCount:    conversation.MessageCount,
+		Unread:          conversation.Unread,
+		NeedsAttention:  conversation.NeedsAttention,
+		Participants:    conversation.Participants,
+		Preview:         conversation.Preview,
+		LatestUpdate:    latestUpdate,
+		Category:        conversation.Category,
+		ReasonCodes:     conversation.ReasonCodes,
+		AIStatus:        conversation.AIStatus,
+	}
+}
+
+func (s *Server) handleGmailSyncStatus(w http.ResponseWriter, r *http.Request) {
+	if s.mailSync == nil {
+		writeError(w, http.StatusServiceUnavailable, "mail_sync_unavailable", "Local mailbox storage is unavailable.")
+		return
+	}
+	credential, err := s.validCredential(r.Context())
+	if errors.Is(err, credentials.ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "gmail_not_connected", "Connect Gmail before synchronizing the inbox.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
+		return
+	}
+	status, err := s.mailSync.Status(r.Context(), credential.EmailAddress)
+	if err != nil {
+		slog.Error("gmail sync status failed", "request_id", requestIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, "mail_sync_status_failed", "Could not read local synchronization status.")
+		return
+	}
+	status, err = s.withConversationProcessingStatus(r.Context(), credential.EmailAddress, status)
+	if err != nil {
+		slog.Error("conversation processing status failed", "request_id", requestIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, "conversation_processing_failed", "Could not inspect cached conversations.")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleGmailSync(w http.ResponseWriter, r *http.Request) {
+	if s.mailSync == nil {
+		writeError(w, http.StatusServiceUnavailable, "mail_sync_unavailable", "Local mailbox storage is unavailable.")
+		return
+	}
+	credential, err := s.validCredential(r.Context())
+	if errors.Is(err, credentials.ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "gmail_not_connected", "Connect Gmail before synchronizing the inbox.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
+		return
+	}
+	currentStatus, err := s.mailSync.Status(r.Context(), credential.EmailAddress)
+	if err != nil {
+		slog.Error("gmail sync status failed before conversation processing",
+			"request_id", requestIDFromContext(r.Context()),
+		)
+		writeError(w, http.StatusInternalServerError, "mail_sync_status_failed", "Could not read local synchronization status.")
+		return
+	}
+	if currentStatus.Complete && s.conversationProcessor != nil {
+		account, accountErr := s.repository.AccountByProviderEmail(r.Context(), "gmail", credential.EmailAddress)
+		if accountErr != nil {
+			slog.Error("conversation account lookup failed", "request_id", requestIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "conversation_processing_failed", "Could not process cached conversations.")
+			return
+		}
+		pending, pendingErr := s.conversationProcessor.PendingCount(r.Context(), account.ID)
+		if pendingErr != nil {
+			slog.Error("pending conversation count failed", "request_id", requestIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "conversation_processing_failed", "Could not process cached conversations.")
+			return
+		}
+		if pending > 0 {
+			result, processErr := s.conversationProcessor.ProcessNext(
+				r.Context(), account, credential, s.selectedOllamaModel,
+			)
+			if processErr != nil {
+				slog.Error("cached conversation processing failed",
+					"request_id", requestIDFromContext(r.Context()),
+					"error", processErr,
+				)
+				if isGmailRateLimit(processErr) {
+					w.Header().Set("Retry-After", "5")
+					writeError(w, http.StatusTooManyRequests, "gmail_rate_limited", "Gmail temporarily rate-limited indexing. Wait a moment, then resume.")
+					return
+				}
+				writeError(w, http.StatusBadGateway, "conversation_processing_failed", "Could not process a cached conversation.")
+				return
+			}
+			currentStatus.Phase = "processing"
+			currentStatus.Complete = false
+			// One final request checks Gmail History after the last cached
+			// conversation, so processing responses always keep the loop alive.
+			currentStatus.HasMore = true
+			currentStatus.PendingConversations = result.Remaining
+			if result.Processed {
+				currentStatus.ConversationsProcessed = 1
+			}
+			if result.Created {
+				currentStatus.ConversationsCreated = 1
+			}
+			writeJSON(w, http.StatusOK, currentStatus)
+			return
+		}
+		grouped, groupErr := s.repository.GroupRelatedWorkspaceConversations(r.Context(), account.ID)
+		if groupErr != nil {
+			slog.Error("workspace conversation grouping failed", "request_id", requestIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "conversation_grouping_failed", "Could not group cached conversations.")
+			return
+		}
+		if grouped {
+			slog.Info("related workspace conversations grouped", "request_id", requestIDFromContext(r.Context()))
+			currentStatus.Phase = "processing"
+			currentStatus.Complete = false
+			currentStatus.HasMore = true
+			writeJSON(w, http.StatusOK, currentStatus)
+			return
+		}
+	}
+	status, err := s.mailSync.SyncNextPage(r.Context(), credential)
+	if err != nil {
+		gmailStatus, gmailReason, _ := googleapi.GmailErrorDetails(err)
+		slog.Error("gmail synchronization failed",
+			"request_id", requestIDFromContext(r.Context()),
+			"gmail_status", gmailStatus,
+			"gmail_reason", fallbackLogValue(gmailReason, "unknown"),
+		)
+		writeError(w, http.StatusBadGateway, "mail_sync_failed", "Could not synchronize Gmail.")
+		return
+	}
+	status, err = s.withConversationProcessingStatus(r.Context(), credential.EmailAddress, status)
+	if err != nil {
+		slog.Error("conversation processing status failed", "request_id", requestIDFromContext(r.Context()))
+		writeError(w, http.StatusInternalServerError, "conversation_processing_failed", "Could not inspect cached conversations.")
+		return
+	}
+	slog.Info("gmail synchronization advanced",
+		"request_id", requestIDFromContext(r.Context()),
+		"phase", status.Phase,
+		"processed", status.Processed,
+		"onboarding_processed", status.OnboardingProcessed,
+		"estimated_total", status.EstimatedTotal,
+		"messages_cached", status.MessagesCached,
+		"complete", status.Complete,
+		"has_more", status.HasMore,
+	)
+	writeJSON(w, http.StatusOK, status)
+}
+
+func isGmailRateLimit(err error) bool {
+	status, reason, found := googleapi.GmailErrorDetails(err)
+	if !found {
+		return false
+	}
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if status != http.StatusForbidden {
+		return false
+	}
+	switch reason {
+	case "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded",
+		"RATE_LIMIT_EXCEEDED", "USER_RATE_LIMIT_EXCEEDED", "QUOTA_EXCEEDED":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) withConversationProcessingStatus(
+	ctx context.Context,
+	emailAddress string,
+	status mailsync.Status,
+) (mailsync.Status, error) {
+	if !status.Complete || s.conversationProcessor == nil {
+		return status, nil
+	}
+	account, err := s.repository.AccountByProviderEmail(ctx, "gmail", emailAddress)
+	if err != nil {
+		return mailsync.Status{}, err
+	}
+	pending, err := s.conversationProcessor.PendingCount(ctx, account.ID)
+	if err != nil {
+		return mailsync.Status{}, err
+	}
+	if pending > 0 {
+		status.Phase = "processing"
+		status.Complete = false
+		status.HasMore = true
+		status.PendingConversations = pending
+	}
+	return status, nil
+}
+
+func fallbackLogValue(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 type ollamaModelResponse struct {

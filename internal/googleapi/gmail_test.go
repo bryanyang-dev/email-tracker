@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,6 +123,145 @@ func TestThreadRetrievesExternalTextBody(t *testing.T) {
 	}
 }
 
+func TestInboxReturnsGroupingHeaders(t *testing.T) {
+	requests := 0
+	httpClient := &http.Client{Transport: gmailRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		switch request.URL.Path {
+		case "/gmail/v1/users/me/messages":
+			return gmailJSONResponse(`{"messages":[{"id":"message-1","threadId":"thread-1"}]}`), nil
+		case "/gmail/v1/users/me/messages/message-1":
+			if request.URL.Query().Get("format") != "metadata" {
+				t.Fatalf("format = %q", request.URL.Query().Get("format"))
+			}
+			return gmailJSONResponse(`{
+				"id":"message-1",
+				"threadId":"thread-1",
+				"internalDate":"1000",
+				"labelIds":["INBOX","UNREAD"],
+				"snippet":"Latest update",
+				"payload":{"headers":[
+					{"name":"Subject","value":"Re: Project update"},
+					{"name":"Message-ID","value":"<message-1@example.com>"},
+					{"name":"In-Reply-To","value":"<message-0@example.com>"},
+					{"name":"References","value":"<message-a@example.com> <message-0@example.com>"},
+					{"name":"Cc","value":"team@example.com"}
+				]}
+			}`), nil
+		default:
+			t.Fatalf("unexpected path %q", request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := NewGmailClient(httpClient)
+
+	page, err := client.Inbox(context.Background(), credentials.OAuthCredential{AccessToken: "token"}, "50", "")
+	if err != nil {
+		t.Fatalf("Inbox() error = %v", err)
+	}
+	if requests != 2 || len(page.Messages) != 1 {
+		t.Fatalf("requests = %d, messages = %#v", requests, page.Messages)
+	}
+	message := page.Messages[0]
+	if message.RFCMessageID != "<message-1@example.com>" || message.InReplyTo != "<message-0@example.com>" {
+		t.Fatalf("message identifiers = %#v", message)
+	}
+	if len(message.References) != 2 || message.Cc != "team@example.com" {
+		t.Fatalf("grouping metadata = %#v", message)
+	}
+}
+
+func TestInboxRetriesTransientMetadataFailure(t *testing.T) {
+	metadataAttempts := 0
+	httpClient := &http.Client{Transport: gmailRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/gmail/v1/users/me/messages":
+			return gmailJSONResponse(`{"messages":[{"id":"message-1","threadId":"thread-1"}]}`), nil
+		case "/gmail/v1/users/me/messages/message-1":
+			metadataAttempts++
+			if metadataAttempts == 1 {
+				return gmailErrorResponse(http.StatusForbidden, "rateLimitExceeded"), nil
+			}
+			return gmailJSONResponse(`{
+				"id":"message-1",
+				"threadId":"thread-1",
+				"internalDate":"1000",
+				"payload":{"headers":[]}
+			}`), nil
+		default:
+			t.Fatalf("unexpected path %q", request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := NewGmailClient(httpClient)
+	client.retryBaseDelay = 0
+
+	page, err := client.Inbox(context.Background(), credentials.OAuthCredential{AccessToken: "token"}, "50", "")
+	if err != nil {
+		t.Fatalf("Inbox() error = %v", err)
+	}
+	if metadataAttempts != 2 || len(page.Messages) != 1 {
+		t.Fatalf("attempts = %d, messages = %#v", metadataAttempts, page.Messages)
+	}
+}
+
+func TestInboxReturnsPermanentGmailFailureDetails(t *testing.T) {
+	metadataAttempts := 0
+	httpClient := &http.Client{Transport: gmailRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/gmail/v1/users/me/messages" {
+			return gmailJSONResponse(`{"messages":[{"id":"message-1","threadId":"thread-1"}]}`), nil
+		}
+		metadataAttempts++
+		return gmailErrorResponse(http.StatusForbidden, "insufficientPermissions"), nil
+	})}
+	client := NewGmailClient(httpClient)
+	client.retryBaseDelay = 0
+
+	_, err := client.Inbox(context.Background(), credentials.OAuthCredential{AccessToken: "token"}, "50", "")
+	if err == nil {
+		t.Fatal("Inbox() succeeded, want error")
+	}
+	status, reason, found := GmailErrorDetails(err)
+	if !found || status != http.StatusForbidden || reason != "insufficientPermissions" {
+		t.Fatalf("GmailErrorDetails() = %d, %q, %v", status, reason, found)
+	}
+	if metadataAttempts != 1 {
+		t.Fatalf("metadata attempts = %d, want 1", metadataAttempts)
+	}
+}
+
+func TestHistoryReturnsChangedAndDeletedMessages(t *testing.T) {
+	httpClient := &http.Client{Transport: gmailRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/gmail/v1/users/me/history" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		if request.URL.Query().Get("startHistoryId") != "history-10" ||
+			request.URL.Query().Get("pageToken") != "page-2" {
+			t.Fatalf("query = %q", request.URL.RawQuery)
+		}
+		return gmailJSONResponse(`{
+			"history":[{
+				"messages":[{"id":"message-1","threadId":"thread-1"}],
+				"messagesAdded":[{"message":{"id":"message-2","threadId":"thread-2"}}],
+				"messagesDeleted":[{"message":{"id":"message-1","threadId":"thread-1"}}],
+				"labelsAdded":[{"message":{"id":"message-3","threadId":"thread-3"}}]
+			}],
+			"historyId":"history-20"
+		}`), nil
+	})}
+	client := NewGmailClient(httpClient)
+	client.minimumRequestInterval = 0
+
+	page, err := client.History(context.Background(), credentials.OAuthCredential{AccessToken: "token"}, "history-10", "page-2")
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if page.HistoryID != "history-20" || len(page.NewMessages) != 1 ||
+		len(page.ChangedMessages) != 1 || len(page.DeletedMessages) != 1 {
+		t.Fatalf("History() = %#v", page)
+	}
+}
+
 func TestDecodeBase64URLTruncatesAtByteLimit(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte("abcdef"))
 
@@ -147,5 +287,17 @@ func gmailJSONResponse(body string) *http.Response {
 		Header:     http.Header{"Content-Type": {"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    &http.Request{},
+	}
+}
+
+func gmailErrorResponse(status int, reason string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"code":` + strconv.Itoa(status) + `,"status":"PERMISSION_DENIED","errors":[{"reason":"` + reason + `"}]}}`,
+		)),
+		Request: &http.Request{},
 	}
 }

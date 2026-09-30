@@ -16,14 +16,13 @@ export interface ActionItem {
 
 export interface EmailThread {
   id: string;
-  gmailThreadId: string;
   title: string;
   participants: string[];
   updatedAt: string;
   preview: string;
   latestUpdate: string;
   summary: string;
-  state: "active" | "suggested" | "snoozed" | "resolved" | "ordinary";
+  state: "active" | "suggested" | "snoozed" | "resolved";
   needsAttention: boolean;
   unread: boolean;
   actionItems: ActionItem[];

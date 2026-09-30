@@ -4,26 +4,20 @@ export interface GmailConnectionStatus {
   emailAddress?: string;
 }
 
-export interface GmailInboxMessage {
-  id: string;
-  threadId: string;
-  subject: string;
-  from: string;
-  to: string;
-  date: string;
-  snippet: string;
-  unread: boolean;
-  labelIds: string[];
-  internalAt: string;
+export interface GmailSyncStatus {
+  phase: "not_started" | "discovering" | "catching_up" | "processing" | "complete" | "reconciling";
+  complete: boolean;
+  messagesCached: number;
+  hasMore: boolean;
+  processed: number;
+  onboardingProcessed: number;
+  estimatedTotal: number;
+  pendingConversations: number;
+  conversationsProcessed: number;
+  conversationsCreated: number;
 }
 
-export interface GmailInboxPage {
-  messages: GmailInboxMessage[];
-  nextPageToken?: string;
-  resultSize: number;
-}
-
-export interface GmailConversationMessage {
+export interface WorkspaceConversationMessage {
   id: string;
   threadId: string;
   rfcMessageId?: string;
@@ -45,28 +39,38 @@ export interface GmailConversationMessage {
   hasFeedbackId?: boolean;
 }
 
-export interface GmailConversation {
+export interface WorkspaceConversationSummary {
   id: string;
-  historyId: string;
-  messages: GmailConversationMessage[];
-  truncated: boolean;
-}
-
-export interface GmailTriageAssessment {
-  visibility: "active" | "suggested" | "all";
+  title: string;
+  state: "active" | "suggested" | "snoozed" | "resolved";
+  importance: "important" | "possibly_important";
+  importanceScore: number;
+  updatedAt: string;
+  messageCount: number;
+  unread: boolean;
+  needsAttention: boolean;
+  participants: string[];
+  preview: string;
+  latestUpdate: string;
   category: string;
-  needsAction: boolean;
-  urgent: boolean;
-  confidence: number;
   reasonCodes: string[];
-  sourceMessageIds: string[];
-  aiStatus: "applied" | "rules" | "unavailable" | "failed";
-  model?: string;
+  aiStatus: "pending" | "applied" | "rules" | "unavailable" | "failed";
 }
 
-export interface GmailThreadTriage {
-  conversation: GmailConversation;
-  triage: GmailTriageAssessment;
+export interface WorkspaceConversation extends WorkspaceConversationSummary {
+  messages: WorkspaceConversationMessage[];
+}
+
+export interface WorkspaceConversationPage {
+  conversations: WorkspaceConversationSummary[];
+  counts: {
+    active: number;
+    attention: number;
+    suggested: number;
+    snoozed: number;
+    resolved: number;
+    all: number;
+  };
 }
 
 export interface OllamaModel {
@@ -161,20 +165,49 @@ export function beginGmailAuthorization(): Promise<GmailAuthorization> {
   return request("/api/v1/auth/gmail/start", { method: "POST" });
 }
 
-export function loadGmailInbox(pageToken = ""): Promise<GmailInboxPage> {
-  const query = new URLSearchParams({ limit: "5" });
-  if (pageToken) query.set("pageToken", pageToken);
-  return request(`/api/v1/gmail/messages?${query.toString()}`);
+let pendingGmailSync: Promise<GmailSyncStatus> | undefined;
+const gmailSyncListeners = new Set<(status: GmailSyncStatus) => void>();
+
+export function synchronizeGmailMailbox(
+  onProgress?: (status: GmailSyncStatus) => void,
+): Promise<GmailSyncStatus> {
+  if (onProgress) gmailSyncListeners.add(onProgress);
+
+  if (!pendingGmailSync) {
+    const run = async () => {
+      let status: GmailSyncStatus;
+      do {
+        status = await request<GmailSyncStatus>("/api/v1/gmail/sync", { method: "POST" });
+        gmailSyncListeners.forEach((listener) => listener(status));
+      } while (status.hasMore);
+      return status;
+    };
+    const attempt = run();
+    pendingGmailSync = attempt;
+    void attempt.then(
+      () => {
+        if (pendingGmailSync === attempt) pendingGmailSync = undefined;
+      },
+      () => {
+        if (pendingGmailSync === attempt) pendingGmailSync = undefined;
+      },
+    );
+  }
+
+  const sync = pendingGmailSync;
+  if (!onProgress) return sync;
+  return sync.finally(() => gmailSyncListeners.delete(onProgress));
 }
 
-export function loadGmailConversation(threadId: string): Promise<GmailConversation> {
-  return request(`/api/v1/gmail/threads/${encodeURIComponent(threadId)}`);
+export function loadWorkspaceConversations(
+  view: string,
+): Promise<WorkspaceConversationPage> {
+  const query = new URLSearchParams({ view });
+  return request(`/api/v1/conversations?${query.toString()}`);
 }
 
-export function triageGmailConversation(threadId: string): Promise<GmailThreadTriage> {
-  return request(`/api/v1/gmail/threads/${encodeURIComponent(threadId)}/triage`, {
-    method: "POST",
-  });
+export function loadWorkspaceConversation(id: string): Promise<WorkspaceConversation> {
+  return request(`/api/v1/conversations/${encodeURIComponent(id)}`);
 }
 
 export function ollamaStatus(): Promise<OllamaStatus> {

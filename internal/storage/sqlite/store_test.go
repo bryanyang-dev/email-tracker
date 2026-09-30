@@ -36,8 +36,8 @@ func TestOpenConfiguresAndMigratesDatabase(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatalf("read schema migrations: %v", err)
 	}
-	if migrationCount != 1 {
-		t.Fatalf("migration count = %d, want 1", migrationCount)
+	if migrationCount != 6 {
+		t.Fatalf("migration count = %d, want 6", migrationCount)
 	}
 
 	info, err := os.Stat(path)
@@ -74,6 +74,8 @@ func TestRepositoryPersistsIdempotentMailboxState(t *testing.T) {
 		HistoryID:           "history-20",
 		InitialPageToken:    "page-2",
 		InitialSyncComplete: false,
+		OnboardingProcessed: 20,
+		EstimatedTotal:      42,
 	}
 	if err := store.SaveSyncCursor(ctx, cursor); err != nil {
 		t.Fatalf("SaveSyncCursor() error = %v", err)
@@ -82,7 +84,8 @@ func TestRepositoryPersistsIdempotentMailboxState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncCursor() error = %v", err)
 	}
-	if gotCursor.HistoryID != cursor.HistoryID || gotCursor.InitialPageToken != cursor.InitialPageToken {
+	if gotCursor.HistoryID != cursor.HistoryID || gotCursor.InitialPageToken != cursor.InitialPageToken ||
+		gotCursor.OnboardingProcessed != 20 || gotCursor.EstimatedTotal != 42 {
 		t.Fatalf("SyncCursor() = %#v, want %#v", gotCursor, cursor)
 	}
 
@@ -160,6 +163,25 @@ func TestRepositoryPersistsIdempotentMailboxState(t *testing.T) {
 	if persisted.Subject != message.Subject || len(persisted.References) != 1 {
 		t.Fatalf("persisted message = %#v", persisted)
 	}
+	conversations, counts, err := reopened.WorkspaceConversations(ctx, "all")
+	if err != nil {
+		t.Fatalf("WorkspaceConversations() error = %v", err)
+	}
+	if counts.All != 1 || counts.Active != 1 || len(conversations) != 1 {
+		t.Fatalf("WorkspaceConversations() = %#v, counts = %#v", conversations, counts)
+	}
+	if got := conversations[0]; got.ID != conversation.ID || got.Title != conversation.Title ||
+		got.MessageCount != 1 || !got.Unread || got.LatestBody != "The project is ready for review." {
+		t.Fatalf("conversation projection = %#v", got)
+	}
+	detail, err := reopened.WorkspaceConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("WorkspaceConversation() error = %v", err)
+	}
+	if len(detail.Messages) != 1 || detail.Messages[0].ProviderMessageID != "gmail-message-1" ||
+		detail.Messages[0].Body != "The project is ready for review." {
+		t.Fatalf("conversation detail = %#v", detail)
+	}
 }
 
 func TestCreateConversationRejectsLowValueMail(t *testing.T) {
@@ -176,6 +198,73 @@ func TestCreateConversationRejectsLowValueMail(t *testing.T) {
 	}, []string{"thread-1"}, []string{"message-1"})
 	if err == nil {
 		t.Fatal("CreateConversation() accepted low-value mail")
+	}
+}
+
+func TestGroupRelatedWorkspaceConversationsMergesRecruitingThreads(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "workspace.sqlite"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+	account, err := store.EnsureAccount(ctx, "gmail", "person@example.com")
+	if err != nil {
+		t.Fatalf("EnsureAccount() error = %v", err)
+	}
+	now := time.Now().UTC()
+	for _, message := range []storage.Message{
+		{
+			AccountID: account.ID, ProviderMessageID: "message-1", ProviderThreadID: "thread-1",
+			Subject: "Your interview with Snorkel AI", NormalizedSubject: "your interview with snorkel ai",
+			From: "Recruiting <recruiting@snorkel.ai>", InternalAt: now.Add(-24 * time.Hour),
+			Body: "Interview details", BodyState: storage.BodyHydrated, Importance: storage.ImportanceImportant,
+		},
+		{
+			AccountID: account.ID, ProviderMessageID: "message-2", ProviderThreadID: "thread-2",
+			Subject: "Reminder: Snorkel AI technical screen", NormalizedSubject: "reminder: snorkel ai technical screen",
+			From: "Scheduler <scheduler@greenhouse.io>", InternalAt: now,
+			Body: "Screen reminder", BodyState: storage.BodyHydrated, Importance: storage.ImportanceImportant,
+		},
+	} {
+		if _, err := store.UpsertMessage(ctx, message); err != nil {
+			t.Fatalf("UpsertMessage(%s) error = %v", message.ProviderMessageID, err)
+		}
+	}
+	if err := store.CreateConversation(ctx, storage.Conversation{
+		ID: "conversation-1", AccountID: account.ID, Title: "Your interview with Snorkel AI",
+		Importance: storage.ImportanceImportant, ImportanceScore: 0.9, LastMessageAt: now.Add(-24 * time.Hour),
+	}, []string{"thread-1"}, []string{"message-1"}); err != nil {
+		t.Fatalf("CreateConversation(1) error = %v", err)
+	}
+	if err := store.CreateConversation(ctx, storage.Conversation{
+		ID: "conversation-2", AccountID: account.ID, Title: "Reminder: Snorkel AI technical screen",
+		Importance: storage.ImportanceImportant, ImportanceScore: 0.95, LastMessageAt: now,
+	}, []string{"thread-2"}, []string{"message-2"}); err != nil {
+		t.Fatalf("CreateConversation(2) error = %v", err)
+	}
+
+	grouped, err := store.GroupRelatedWorkspaceConversations(ctx, account.ID)
+	if err != nil {
+		t.Fatalf("GroupRelatedWorkspaceConversations() error = %v", err)
+	}
+	if !grouped {
+		t.Fatal("GroupRelatedWorkspaceConversations() did not merge related threads")
+	}
+	conversations, counts, err := store.WorkspaceConversations(ctx, "all")
+	if err != nil {
+		t.Fatalf("WorkspaceConversations() error = %v", err)
+	}
+	if len(conversations) != 1 || counts.All != 1 || conversations[0].MessageCount != 2 {
+		t.Fatalf("grouped conversations = %#v, counts = %#v", conversations, counts)
+	}
+	detail, err := store.WorkspaceConversation(ctx, conversations[0].ID)
+	if err != nil || len(detail.Messages) != 2 {
+		t.Fatalf("WorkspaceConversation() = %#v, error = %v", detail, err)
+	}
+	grouped, err = store.GroupRelatedWorkspaceConversations(ctx, account.ID)
+	if err != nil || grouped {
+		t.Fatalf("second grouping = %v, error = %v", grouped, err)
 	}
 }
 

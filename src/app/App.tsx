@@ -1,28 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   APIError,
   beginGmailAuthorization,
   createLocalSession,
   gmailConnectionStatus,
-  loadGmailConversation,
-  loadGmailInbox,
+  loadWorkspaceConversation,
+  loadWorkspaceConversations,
   ollamaStatus,
-  triageGmailConversation,
-  type GmailConversation,
-  type GmailInboxMessage,
-  type GmailThreadTriage,
-  type GmailTriageAssessment,
+  synchronizeGmailMailbox,
+  type GmailSyncStatus,
+  type WorkspaceConversation,
+  type WorkspaceConversationSummary,
 } from "./api";
 import { navigationItems } from "./navigation";
 import type { ConnectionState, EmailThread, LocalAIState, ThreadView } from "./types";
-
-function threadsForView(view: ThreadView, allThreads: EmailThread[]): EmailThread[] {
-  if (view === "all") return allThreads;
-  if (view === "attention") {
-    return allThreads.filter((thread) => thread.needsAttention);
-  }
-  return allThreads.filter((thread) => thread.state === view);
-}
 
 function displayName(view: ThreadView): string {
   return navigationItems.find((item) => item.id === view)?.label ?? "Threads";
@@ -35,17 +26,25 @@ export function App() {
   const [localAI, setLocalAI] = useState<LocalAIState>({ status: "checking" });
   const [notice, setNotice] = useState<string | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
+  const [mailboxSync, setMailboxSync] = useState<"idle" | "syncing" | "ready" | "failed">("idle");
+  const [mailboxSyncStatus, setMailboxSyncStatus] = useState<GmailSyncStatus | null>(null);
+  const [mailboxSyncError, setMailboxSyncError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState("");
-  const [pageIndex, setPageIndex] = useState(0);
-  const [pageTokens, setPageTokens] = useState<string[]>([""]);
-  const [nextPageToken, setNextPageToken] = useState("");
-  const [conversations, setConversations] = useState<Record<string, GmailConversation>>({});
+  const [counts, setCounts] = useState<Record<ThreadView, number>>({
+    active: 0,
+    attention: 0,
+    suggested: 0,
+    snoozed: 0,
+    resolved: 0,
+    all: 0,
+  });
+  const [conversations, setConversations] = useState<Record<string, WorkspaceConversation>>({});
   const [conversationLoadingId, setConversationLoadingId] = useState("");
-  const triageCache = useRef(new Map<string, GmailThreadTriage>());
-  const threads = useMemo(() => threadsForView(view, allThreads), [view, allThreads]);
+  const viewRequest = useRef(0);
+  const threads = allThreads;
   const selected =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
-  const selectedConversation = selected ? conversations[selected.gmailThreadId] : undefined;
+  const selectedConversation = selected ? conversations[selected.id] : undefined;
 
   useEffect(() => {
     const oauthResult = new URLSearchParams(window.location.search);
@@ -61,15 +60,15 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const threadId = selected?.gmailThreadId;
-    if (connection.status !== "connected" || !threadId || conversations[threadId]) return;
+    const conversationId = selected?.id;
+    if (connection.status !== "connected" || !conversationId || conversations[conversationId]) return;
 
     let cancelled = false;
-    setConversationLoadingId(threadId);
-    void loadGmailConversation(threadId)
+    setConversationLoadingId(conversationId);
+    void loadWorkspaceConversation(conversationId)
       .then((conversation) => {
         if (!cancelled) {
-          setConversations((current) => ({ ...current, [threadId]: conversation }));
+          setConversations((current) => ({ ...current, [conversationId]: conversation }));
         }
       })
       .catch((error) => {
@@ -82,7 +81,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [connection.status, conversations, selected?.gmailThreadId]);
+  }, [connection.status, conversations, selected?.id]);
 
   async function initialize() {
     try {
@@ -98,10 +97,26 @@ export function App() {
         return;
       }
       setConnection({ status: "connected", emailAddress: status.emailAddress ?? "Gmail" });
-      await loadInboxPage(0, "");
+      startMailboxSync();
+      await loadConversationView("active");
     } catch (error) {
       setConnection({ status: "offline", message: errorMessage(error) });
     }
+  }
+
+  function startMailboxSync() {
+    setMailboxSync("syncing");
+    setMailboxSyncError(null);
+    void synchronizeGmailMailbox(setMailboxSyncStatus).then(
+      () => {
+        setMailboxSync("ready");
+        void loadConversationView(view);
+      },
+      (error) => {
+        setMailboxSync("failed");
+        setMailboxSyncError(errorMessage(error));
+      },
+    );
   }
 
   async function refreshLocalAI() {
@@ -122,77 +137,28 @@ export function App() {
     }
   }
 
-  async function loadInboxPage(nextPageIndex: number, pageToken: string) {
+  async function loadConversationView(nextView: ThreadView) {
+    const requestID = viewRequest.current + 1;
+    viewRequest.current = requestID;
     setInboxLoading(true);
     try {
-      const inbox = await loadGmailInbox(pageToken);
-      const nextThreads = inbox.messages.map(messageToThread);
+      const page = await loadWorkspaceConversations(nextView);
+      if (requestID !== viewRequest.current) return;
+      const nextThreads = page.conversations.map(conversationToThread);
       setAllThreads(nextThreads);
-      setPageIndex(nextPageIndex);
-      setNextPageToken(inbox.nextPageToken ?? "");
+      setCounts(page.counts);
       setSelectedId((current) =>
         nextThreads.some((thread) => thread.id === current) ? current : (nextThreads[0]?.id ?? ""),
       );
-      const triageResults: Array<{
-        thread: EmailThread;
-        conversation?: GmailConversation;
-      }> = [];
-      for (const thread of nextThreads) {
-        try {
-          const cacheKey = `${thread.gmailThreadId}:${thread.id}`;
-          const result =
-            triageCache.current.get(cacheKey) ??
-            (await triageGmailConversation(thread.gmailThreadId));
-          triageCache.current.set(cacheKey, result);
-          triageResults.push({
-            thread: applyTriage(thread, result.triage),
-            conversation: result.conversation,
-          });
-          setConversations((current) => ({
-            ...current,
-            [thread.gmailThreadId]: result.conversation,
-          }));
-        } catch {
-          triageResults.push({ thread: { ...thread, triageStatus: "failed" } });
-        }
-        setAllThreads([
-          ...triageResults.map((result) => result.thread),
-          ...nextThreads.slice(triageResults.length),
-        ]);
-      }
-      setAllThreads(triageResults.map((result) => result.thread));
-      setNotice(
-        triageResults.some((result) => result.thread.triageStatus === "failed")
-          ? "Some conversations could not be triaged and remain in Suggested."
-          : null,
-      );
     } catch (error) {
-      setNotice(errorMessage(error));
+      if (requestID === viewRequest.current) setNotice(errorMessage(error));
     } finally {
-      setInboxLoading(false);
+      if (requestID === viewRequest.current) setInboxLoading(false);
     }
   }
 
   function refreshInbox() {
-    void loadInboxPage(pageIndex, pageTokens[pageIndex] ?? "");
-  }
-
-  function showNextPage() {
-    if (!nextPageToken || inboxLoading) return;
-    const targetIndex = pageIndex + 1;
-    const targetToken = nextPageToken;
-    setPageTokens((current) => {
-      const next = current.slice(0, targetIndex);
-      next[targetIndex] = targetToken;
-      return next;
-    });
-    void loadInboxPage(targetIndex, targetToken);
-  }
-
-  function showPreviousPage() {
-    if (pageIndex === 0 || inboxLoading) return;
-    const targetIndex = pageIndex - 1;
-    void loadInboxPage(targetIndex, pageTokens[targetIndex] ?? "");
+    void loadConversationView(view);
   }
 
   async function connectGmail() {
@@ -206,8 +172,8 @@ export function App() {
 
   function selectView(nextView: ThreadView) {
     setView(nextView);
-    const nextThreads = threadsForView(nextView, allThreads);
-    setSelectedId(nextThreads[0]?.id ?? "");
+    setSelectedId("");
+    void loadConversationView(nextView);
   }
 
   return (
@@ -230,7 +196,7 @@ export function App() {
               const count =
                 item.id === "search" || item.id === "settings"
                   ? null
-                  : threadsForView(item.id, allThreads).length;
+                  : counts[item.id];
               const available = item.id !== "search" && item.id !== "settings";
 
               return (
@@ -301,15 +267,22 @@ export function App() {
 
         {notice && <div className="notice" role="status">{notice}</div>}
 
-        <ConnectionBanner connection={connection} inboxLoading={inboxLoading} />
+        <ConnectionBanner
+          connection={connection}
+          inboxLoading={inboxLoading}
+          mailboxSync={mailboxSync}
+          mailboxSyncStatus={mailboxSyncStatus}
+          mailboxSyncError={mailboxSyncError}
+          onResumeSync={startMailboxSync}
+        />
 
-        <div className={threads.length ? "thread-items paginated" : "thread-items"}>
+        <div className="thread-items">
           {connection.status !== "connected" ? (
             <ConnectionCard connection={connection} onConnect={() => void connectGmail()} />
           ) : threads.length === 0 ? (
             <div className="empty-state">
               <h2>{inboxLoading ? "Loading inbox…" : "Nothing here yet"}</h2>
-              <p>{inboxLoading ? "Retrieving recent Gmail messages." : "Threads in this state will appear here."}</p>
+              <p>{inboxLoading ? "Reading the local conversation index." : "Threads in this state will appear here."}</p>
             </div>
           ) : (
             threads.map((thread) => (
@@ -332,7 +305,6 @@ export function App() {
                 <span className="thread-meta">
                   {thread.needsAttention && <span className="attention-tag">Needs attention</span>}
                   {thread.state === "suggested" && <span className="attention-tag">Suggested</span>}
-                  {thread.state === "ordinary" && <span className="low-priority-tag">Low priority</span>}
                   <span>{thread.messageCount} messages</span>
                 </span>
               </button>
@@ -340,25 +312,6 @@ export function App() {
           )}
         </div>
 
-        {connection.status === "connected" && (
-          <nav className="pagination" aria-label="Inbox pages">
-            <button
-              type="button"
-              disabled={pageIndex === 0 || inboxLoading}
-              onClick={showPreviousPage}
-            >
-              Previous
-            </button>
-            <span aria-live="polite">Page {pageIndex + 1}</span>
-            <button
-              type="button"
-              disabled={!nextPageToken || inboxLoading}
-              onClick={showNextPage}
-            >
-              Next
-            </button>
-          </nav>
-        )}
       </section>
 
       <section className="thread-detail" aria-label="Selected thread">
@@ -366,7 +319,7 @@ export function App() {
           <ThreadDetail
             thread={selected}
             conversation={selectedConversation}
-            loading={conversationLoadingId === selected.gmailThreadId}
+            loading={conversationLoadingId === selected.id}
           />
         ) : connection.status === "disconnected" ? (
           <ConnectDetail onConnect={() => void connectGmail()} />
@@ -384,7 +337,7 @@ function ThreadDetail({
   loading,
 }: {
   thread: EmailThread;
-  conversation?: GmailConversation;
+  conversation?: WorkspaceConversation;
   loading: boolean;
 }) {
   const latestMessage = conversation?.messages.at(-1);
@@ -495,11 +448,28 @@ function NoSelection() {
 function ConnectionBanner({
   connection,
   inboxLoading,
+  mailboxSync,
+  mailboxSyncStatus,
+  mailboxSyncError,
+  onResumeSync,
 }: {
   connection: ConnectionState;
   inboxLoading: boolean;
+  mailboxSync: "idle" | "syncing" | "ready" | "failed";
+  mailboxSyncStatus: GmailSyncStatus | null;
+  mailboxSyncError: string | null;
+  onResumeSync: () => void;
 }) {
   const connected = connection.status === "connected";
+  const onboarding = mailboxSyncStatus?.phase === "discovering" || mailboxSyncStatus?.phase === "reconciling";
+  const determinate = onboarding &&
+    (mailboxSyncStatus?.estimatedTotal ?? 0) > (mailboxSyncStatus?.onboardingProcessed ?? 0);
+  const percent = determinate
+    ? Math.min(99, Math.floor(
+        ((mailboxSyncStatus?.onboardingProcessed ?? 0) / (mailboxSyncStatus?.estimatedTotal ?? 1)) * 100,
+      ))
+    : undefined;
+  const progressLabel = syncProgressLabel(mailboxSyncStatus, percent);
   return (
     <div className="sync-note" role="status">
       <span className={connected ? "sync-icon" : "sync-icon waiting"} aria-hidden="true">
@@ -508,12 +478,54 @@ function ConnectionBanner({
       <span>
         {connected
           ? inboxLoading
-            ? "Loading and triaging recent Gmail conversations…"
+            ? "Loading conversations from the local index…"
             : `Connected as ${connection.emailAddress}`
           : connectionLabel(connection)}
+        {connected && mailboxSync === "syncing" && (
+          <>
+            <small>{progressLabel}</small>
+            <div
+              className={`sync-progress${determinate ? "" : " indeterminate"}`}
+              role="progressbar"
+              aria-label="Mailbox sync progress"
+              aria-valuemin={determinate ? 0 : undefined}
+              aria-valuemax={determinate ? 100 : undefined}
+              aria-valuenow={percent}
+              aria-valuetext={progressLabel}
+            >
+              <span style={determinate ? { width: `${percent}%` } : undefined} />
+            </div>
+          </>
+        )}
+        {connected && mailboxSync === "ready" && <small>Local mailbox index ready</small>}
+        {connected && mailboxSync === "failed" && (
+          <div className="sync-failed">
+            <small>{mailboxSyncError ?? "Local indexing paused; indexed conversations remain available."}</small>
+            <button type="button" onClick={onResumeSync}>Resume indexing</button>
+          </div>
+        )}
       </span>
     </div>
   );
+}
+
+function syncProgressLabel(status: GmailSyncStatus | null, percent?: number): string {
+  if (!status || status.phase === "not_started") return "Preparing the two-week mail index…";
+  if (status.phase === "catching_up") return "Checking for mail that arrived during setup…";
+  if (status.phase === "processing") {
+    return status.pendingConversations > 0
+      ? `Classifying cached conversations… ${status.pendingConversations} remaining`
+      : "Finishing conversation processing…";
+  }
+  if (status.phase === "reconciling" && percent === undefined && status.onboardingProcessed === 0) {
+    return "Preparing a two-week mailbox refresh…";
+  }
+  if (percent === undefined && status.onboardingProcessed > 0) {
+    const verb = status.phase === "reconciling" ? "Refreshed" : "Indexed";
+    return `${verb} ${status.onboardingProcessed} messages; discovering more…`;
+  }
+  if (percent === undefined) return "Indexing the last two weeks of mail…";
+  return `Indexed ${status.onboardingProcessed} of about ${status.estimatedTotal} messages (${percent}%)`;
 }
 
 function ConnectionCard({
@@ -566,36 +578,24 @@ function ConnectDetail({ onConnect }: { onConnect: () => void }) {
   );
 }
 
-function messageToThread(message: GmailInboxMessage): EmailThread {
+function conversationToThread(conversation: WorkspaceConversationSummary): EmailThread {
   return {
-    id: message.id,
-    gmailThreadId: message.threadId,
-    title: message.subject,
-    participants: [message.from || "Unknown sender"],
-    updatedAt: displayMessageDate(message),
-    preview: message.snippet,
-    latestUpdate: message.snippet || "No message preview is available.",
-    summary: "Local AI enrichment has not run for this conversation yet.",
-    state: "suggested",
-    needsAttention: false,
-    unread: message.unread,
+    id: conversation.id,
+    title: conversation.title,
+    participants: conversation.participants.length ? conversation.participants : ["Unknown sender"],
+    updatedAt: displayConversationDate(conversation.updatedAt),
+    preview: conversation.preview,
+    latestUpdate: conversation.latestUpdate || conversation.preview || "No message preview is available.",
+    summary: "This conversation was selected from the local importance index.",
+    state: conversation.state,
+    needsAttention: conversation.needsAttention,
+    unread: conversation.unread,
     actionItems: [],
     attachmentCount: 0,
-    messageCount: 1,
-    triageCategory: "other",
-    triageReasons: [],
-    triageStatus: "pending",
-  };
-}
-
-function applyTriage(thread: EmailThread, assessment: GmailTriageAssessment): EmailThread {
-  return {
-    ...thread,
-    state: assessment.visibility === "all" ? "ordinary" : assessment.visibility,
-    needsAttention: assessment.needsAction || assessment.urgent,
-    triageCategory: assessment.category,
-    triageReasons: assessment.reasonCodes,
-    triageStatus: assessment.aiStatus,
+    messageCount: conversation.messageCount,
+    triageCategory: conversation.category || "other",
+    triageReasons: conversation.reasonCodes,
+    triageStatus: conversation.aiStatus,
   };
 }
 
@@ -627,15 +627,14 @@ function triageExplanation(thread: EmailThread): string {
   } else if (thread.state === "suggested") {
     explanation = "Kept in Suggested because its importance or required action is uncertain.";
   } else {
-    explanation = `Kept out of Active because it was classified as ${thread.triageCategory.replaceAll("_", " ")}. It remains available in All threads.`;
+    explanation = "This conversation is no longer active.";
   }
   const reasons = thread.triageReasons.map((reason) => reason.replaceAll("_", " "));
   return reasons.length ? `${explanation} Signals: ${reasons.join(", ")}.` : explanation;
 }
 
-function displayMessageDate(message: GmailInboxMessage): string {
-  const millis = Number(message.internalAt);
-  const date = Number.isFinite(millis) && millis > 0 ? new Date(millis) : new Date(message.date);
+function displayConversationDate(value: string): string {
+  const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const today = new Date();
   if (date.toDateString() === today.toDateString()) {

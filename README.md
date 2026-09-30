@@ -34,8 +34,10 @@ configuration directory. On macOS, the default is
 `~/Library/Application Support/Local Email Workspace/workspace.sqlite`. Set
 `APP_DATA_DIR` to an absolute path to override the directory for development.
 The current database foundation uses restrictive file permissions but is not
-yet SQLCipher-encrypted, so normalized email content will not be persisted to
-it until the encryption milestone is complete.
+yet SQLCipher-encrypted. During development it stores Gmail metadata and the
+normalized bodies of conversations selected for local importance processing.
+Do not copy or share the database file; database encryption must be completed
+before packaging the application for general use.
 
 Never copy real client secrets or tokens back into the committed template.
 
@@ -99,10 +101,31 @@ npm run typecheck
 go test ./...
 ```
 
-The React client currently reads Gmail connection status and inbox metadata
-from the local Go API. The Go service initializes the SQLite repository and
-migrations at startup; Gmail synchronization and thread enrichment have not
-yet been switched to that repository.
+The React client reads conversation lists and message bodies only from SQLite
+through the local Go API. Switching views, refreshing, and selecting a conversation do
+not call Gmail or Ollama and do not perform classification on demand. Initial
+onboarding builds a resumable, metadata-only index for a
+fixed two-week window in pages of 20 messages. Message IDs, Gmail thread IDs,
+reply headers, participants, labels, snippets, onboarding completion, and sync
+cursors are cached in SQLite. Returning users use Gmail History changes from
+the last committed checkpoint instead of rescanning the two-week window. An
+expired History checkpoint triggers a bounded two-week reconciliation without
+deleting the existing local workspace. After synchronization, obvious bulk mail
+is resolved from metadata; remaining provider conversations are hydrated once,
+classified locally, and persisted as Active or Suggested workspace
+conversations only when the importance policy allows it.
+
+Mailbox synchronization runs separately in the background. It is the only UI
+flow that fetches new Gmail data and invokes local classification; after a sync
+batch finishes, the client refreshes the current view from SQLite.
+
+Each workspace view is a scrollable database-backed list. Its sidebar count is
+computed across the full local workspace rather than from the currently visible
+rows. After importance processing, a deterministic reconciliation pass combines
+separate Gmail threads when reply headers link them or when a bounded set of
+corroborating subject, recruiting-topic, organization, sender-domain, and time
+signals establishes a high-confidence match. Locked threads and recorded
+never-merge relationships are excluded.
 
 ## Gmail development setup
 
