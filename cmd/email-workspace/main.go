@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/httpapi"
 	"local-email-workspace/internal/ollama"
+	storagesqlite "local-email-workspace/internal/storage/sqlite"
 )
 
 func main() {
@@ -28,6 +30,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+	database, err := storagesqlite.Open(filepath.Join(cfg.DataDirectory, "workspace.sqlite"))
+	if err != nil {
+		return fmt.Errorf("workspace database unavailable: %w", err)
+	}
+	defer database.Close()
+	slog.Info("workspace database ready")
+
 	credentialStore, err := credentials.NewKeychainStore("com.localemailworkspace.gmail", "primary-account")
 	if err != nil {
 		return fmt.Errorf("credential store unavailable: %w", err)

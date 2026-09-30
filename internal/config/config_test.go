@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,30 @@ func TestLoadUsesLoopbackDefaults(t *testing.T) {
 	}
 	if !got.OllamaAutoStart {
 		t.Fatal("OllamaAutoStart = false, want true")
+	}
+	if !filepath.IsAbs(got.DataDirectory) {
+		t.Fatalf("DataDirectory = %q, want an absolute path", got.DataDirectory)
+	}
+}
+
+func TestLoadUsesConfiguredDataDirectory(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "workspace-data")
+	t.Setenv("APP_DATA_DIR", want)
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.DataDirectory != want {
+		t.Fatalf("DataDirectory = %q, want %q", got.DataDirectory, want)
+	}
+}
+
+func TestLoadRejectsRelativeDataDirectory(t *testing.T) {
+	t.Setenv("APP_DATA_DIR", "local-data")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a relative APP_DATA_DIR")
 	}
 }
 

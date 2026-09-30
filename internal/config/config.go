@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 type Config struct {
 	Address           string
 	UIURL             string
+	DataDirectory     string
 	GmailClientID     string
 	GmailClientSecret string
 	OAuthRedirectURL  string
@@ -44,6 +46,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	dataDirectory, err := configuredDataDirectory()
+	if err != nil {
+		return Config{}, err
+	}
 
 	if err := requireLoopbackAddress(address); err != nil {
 		return Config{}, fmt.Errorf("APP_ADDRESS: %w", err)
@@ -58,6 +64,7 @@ func Load() (Config, error) {
 	return Config{
 		Address:           address,
 		UIURL:             uiURL,
+		DataDirectory:     dataDirectory,
 		GmailClientID:     os.Getenv("GMAIL_CLIENT_ID"),
 		GmailClientSecret: os.Getenv("GMAIL_CLIENT_SECRET"),
 		OAuthRedirectURL:  "http://" + address + "/api/v1/auth/gmail/callback",
@@ -65,6 +72,21 @@ func Load() (Config, error) {
 		OllamaAutoStart:   ollamaAutoStart,
 		OllamaModel:       strings.TrimSpace(os.Getenv("OLLAMA_MODEL")),
 	}, nil
+}
+
+func configuredDataDirectory() (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("APP_DATA_DIR")); configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", fmt.Errorf("APP_DATA_DIR: must be an absolute path")
+		}
+		return filepath.Clean(configured), nil
+	}
+
+	configurationDirectory, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("determine application data directory: %w", err)
+	}
+	return filepath.Join(configurationDirectory, "Local Email Workspace"), nil
 }
 
 func loadDotEnv(path string) error {

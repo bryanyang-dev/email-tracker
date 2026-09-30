@@ -6,7 +6,7 @@ service and communicates with it through a same-origin `/api/v1` API.
 ## Prerequisites
 
 - Node.js and npm
-- Go 1.24 or newer
+- Go 1.26 or newer
 - macOS with Xcode Command Line Tools and the Xcode license accepted, required
   by the native Keychain adapter
 - A Google Cloud Desktop OAuth client configured as described below
@@ -28,6 +28,14 @@ npm install
 - Process environment variables take precedence over values in `.env`, which
   allows packaged or automated environments to supply configuration without a
   file.
+
+The service stores its workspace database under the operating system's user
+configuration directory. On macOS, the default is
+`~/Library/Application Support/Local Email Workspace/workspace.sqlite`. Set
+`APP_DATA_DIR` to an absolute path to override the directory for development.
+The current database foundation uses restrictive file permissions but is not
+yet SQLCipher-encrypted, so normalized email content will not be persisted to
+it until the encryption milestone is complete.
 
 Never copy real client secrets or tokens back into the committed template.
 
@@ -91,9 +99,10 @@ npm run typecheck
 go test ./...
 ```
 
-The React client now reads Gmail connection status and inbox metadata from the
-local Go API. SQLite-backed synchronization and thread enrichment are later
-milestones.
+The React client currently reads Gmail connection status and inbox metadata
+from the local Go API. The Go service initializes the SQLite repository and
+migrations at startup; Gmail synchronization and thread enrichment have not
+yet been switched to that repository.
 
 ## Gmail development setup
 
