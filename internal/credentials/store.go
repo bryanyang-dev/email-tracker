@@ -20,5 +20,6 @@ type OAuthCredential struct {
 type Store interface {
 	Load(context.Context) (OAuthCredential, error)
 	Save(context.Context, OAuthCredential) error
+	Cache(OAuthCredential)
 	Delete(context.Context) error
 }

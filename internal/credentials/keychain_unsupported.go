@@ -21,6 +21,8 @@ func (*KeychainStore) Save(context.Context, OAuthCredential) error {
 	return fmt.Errorf("macOS Keychain is unavailable")
 }
 
+func (*KeychainStore) Cache(OAuthCredential) {}
+
 func (*KeychainStore) Delete(context.Context) error {
 	return fmt.Errorf("macOS Keychain is unavailable")
 }

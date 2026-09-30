@@ -3,23 +3,78 @@
 A macOS-first, local email workspace. The React client is served by a local Go
 service and communicates with it through a same-origin `/api/v1` API.
 
-## Frontend development
+## Prerequisites
 
-The frontend uses React, TypeScript, and Vite. Dependencies are intentionally
-kept small; server state will be accessed through feature-scoped hooks rather
-than a global client-side store.
+- Node.js and npm
+- Go 1.24 or newer
+- macOS with Xcode Command Line Tools and the Xcode license accepted, required
+  by the native Keychain adapter
+- A Google Cloud Desktop OAuth client configured as described below
+
+Install the frontend dependencies once:
 
 ```sh
 npm install
+```
+
+## Start the application
+
+Development uses two independent foreground processes. Both terminals must
+remain open; `npm run dev` does not start or supervise the Go API.
+
+In terminal 1, build and start the Go API at a stable local path:
+
+```sh
+npm run dev:api
+```
+
+The launcher rebuilds `.local/bin/email-workspace` and then runs it. This avoids
+the changing temporary executable path created by `go run` and makes Keychain
+authorization behavior more predictable during development.
+
+Wait for this message:
+
+```text
+INFO local email service listening address=http://127.0.0.1:8787 gmail_configured=true
+```
+
+In terminal 2, start the React development server:
+
+```sh
 npm run dev
 ```
 
-Other useful commands:
+Open <http://127.0.0.1:5173>. Vite forwards `/api` requests to the Go service
+at `http://127.0.0.1:8787`.
+
+Stop each process with `Ctrl+C` in its terminal. Closing either terminal stops
+that part of the application.
+
+### Startup troubleshooting
+
+- `ECONNREFUSED 127.0.0.1:8787` means Vite is running but the Go API is not.
+  Start or restart `npm run dev:api` in terminal 1.
+- `gmail_configured=false` means `GMAIL_CLIENT_ID` was not loaded from `.env`
+  or the process environment.
+- `address already in use` means another process is already bound to the port.
+- An Xcode license error must be resolved before Go can compile the native
+  macOS Keychain adapter.
+- macOS may display two login Keychain password prompts when the API first
+  reads the saved Gmail authorization. Approving both prompts is a known,
+  non-blocking development behavior; the service caches the credential after
+  that initial read.
+- Do not use `go run` for normal startup. Its temporary executable identity can
+  make Keychain ask again on every run.
+
+## Development checks
+
+Useful verification commands:
 
 ```sh
 npm run build
 npm run test
 npm run typecheck
+go test ./...
 ```
 
 The React client now reads Gmail connection status and inbox metadata from the
@@ -42,9 +97,8 @@ GMAIL_CLIENT_ID="your-client-id.apps.googleusercontent.com"
 GMAIL_CLIENT_SECRET="your-desktop-client-secret"
 ```
 
-5. Start the local service with `go run ./cmd/email-workspace`.
+5. Follow the two-terminal instructions in **Start the application**.
 
 Process environment variables take precedence over `.env`. The client secret is
 optional for desktop clients. The OAuth callback is
-`http://127.0.0.1:8787/api/v1/auth/gmail/callback`. In another terminal, run
-`npm run dev` and open `http://127.0.0.1:5173`.
+`http://127.0.0.1:8787/api/v1/auth/gmail/callback`.

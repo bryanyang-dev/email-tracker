@@ -236,9 +236,10 @@ func (s *Server) validCredential(ctx context.Context) (credentials.OAuthCredenti
 	if err != nil {
 		return credentials.OAuthCredential{}, err
 	}
-	if err := s.store.Save(ctx, credential); err != nil {
-		return credentials.OAuthCredential{}, err
-	}
+	// Google does not rotate the refresh token in a normal access-token refresh.
+	// Keep the short-lived access token in memory so routine refreshes do not
+	// trigger another macOS Keychain authorization dialog.
+	s.store.Cache(credential)
 	return credential, nil
 }
 
