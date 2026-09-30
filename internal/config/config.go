@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	defaultAddress = "127.0.0.1:8787"
-	defaultUIURL   = "http://127.0.0.1:5173"
+	defaultAddress         = "127.0.0.1:8787"
+	defaultUIURL           = "http://127.0.0.1:5173"
+	defaultOllamaBaseURL   = "http://127.0.0.1:11434"
+	defaultOllamaAutoStart = true
 )
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -25,6 +27,8 @@ type Config struct {
 	GmailClientID     string
 	GmailClientSecret string
 	OAuthRedirectURL  string
+	OllamaBaseURL     string
+	OllamaAutoStart   bool
 }
 
 func Load() (Config, error) {
@@ -34,12 +38,20 @@ func Load() (Config, error) {
 
 	address := envOrDefault("APP_ADDRESS", defaultAddress)
 	uiURL := envOrDefault("APP_UI_URL", defaultUIURL)
+	ollamaBaseURL := envOrDefault("OLLAMA_BASE_URL", defaultOllamaBaseURL)
+	ollamaAutoStart, err := boolEnvOrDefault("OLLAMA_AUTO_START", defaultOllamaAutoStart)
+	if err != nil {
+		return Config{}, err
+	}
 
 	if err := requireLoopbackAddress(address); err != nil {
 		return Config{}, fmt.Errorf("APP_ADDRESS: %w", err)
 	}
 	if err := requireLoopbackURL(uiURL); err != nil {
 		return Config{}, fmt.Errorf("APP_UI_URL: %w", err)
+	}
+	if err := requireLoopbackURL(ollamaBaseURL); err != nil {
+		return Config{}, fmt.Errorf("OLLAMA_BASE_URL: %w", err)
 	}
 
 	return Config{
@@ -48,6 +60,8 @@ func Load() (Config, error) {
 		GmailClientID:     os.Getenv("GMAIL_CLIENT_ID"),
 		GmailClientSecret: os.Getenv("GMAIL_CLIENT_SECRET"),
 		OAuthRedirectURL:  "http://" + address + "/api/v1/auth/gmail/callback",
+		OllamaBaseURL:     ollamaBaseURL,
+		OllamaAutoStart:   ollamaAutoStart,
 	}, nil
 }
 
@@ -127,6 +141,18 @@ func envOrDefault(name, fallback string) string {
 	return fallback
 }
 
+func boolEnvOrDefault(name string, fallback bool) (bool, error) {
+	value, exists := os.LookupEnv(name)
+	if !exists || value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s: must be true or false", name)
+	}
+	return parsed, nil
+}
+
 func requireLoopbackAddress(address string) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -148,6 +174,9 @@ func requireLoopbackURL(rawURL string) error {
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
 		return fmt.Errorf("must not include a path")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("must not include credentials, a query, or a fragment")
 	}
 	return nil
 }

@@ -1,26 +1,36 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"local-email-workspace/internal/config"
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/httpapi"
+	"local-email-workspace/internal/ollama"
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("local email service stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	credentialStore, err := credentials.NewKeychainStore("com.localemailworkspace.gmail", "primary-account")
 	if err != nil {
-		slog.Error("credential store unavailable", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("credential store unavailable: %w", err)
 	}
 
 	outboundClient := &http.Client{
@@ -29,6 +39,22 @@ func main() {
 			return http.ErrUseLastResponse
 		},
 	}
+	applicationContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	ollamaClient := ollama.NewClient(cfg.OllamaBaseURL, outboundClient)
+	ollamaRuntime := ollama.NewRuntime(ollamaClient, cfg.OllamaBaseURL)
+	if cfg.OllamaAutoStart {
+		startupContext, cancelStartup := context.WithTimeout(applicationContext, 10*time.Second)
+		started, startErr := ollamaRuntime.EnsureRunning(startupContext)
+		cancelStartup()
+		if startErr != nil {
+			slog.Warn("Ollama unavailable; continuing without local AI", "error", startErr)
+		} else if started {
+			slog.Info("started local Ollama service", "address", cfg.OllamaBaseURL)
+		}
+	}
+
 	api := httpapi.New(cfg, credentialStore, outboundClient)
 	server := &http.Server{
 		Addr:              cfg.Address,
@@ -39,9 +65,28 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+	}()
+
 	slog.Info("local email service listening", "address", "http://"+cfg.Address, "gmail_configured", cfg.GmailConfigured())
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("local email service stopped", "error", err)
-		os.Exit(1)
+	var serveErr error
+	select {
+	case <-applicationContext.Done():
+	case err := <-serverErrors:
+		if err != nil && err != http.ErrServerClosed {
+			serveErr = err
+		}
 	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		slog.Error("local email service shutdown failed", "error", err)
+	}
+	if err := ollamaRuntime.Stop(shutdownContext); err != nil && err != context.DeadlineExceeded {
+		slog.Warn("Ollama shutdown failed", "error", err)
+	}
+	return serveErr
 }

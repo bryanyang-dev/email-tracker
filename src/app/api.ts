@@ -23,6 +23,19 @@ export interface GmailInboxPage {
   resultSize: number;
 }
 
+export interface OllamaModel {
+  name: string;
+  parameterSize?: string;
+  quantizationLevel?: string;
+  size: number;
+}
+
+export interface OllamaStatus {
+  available: boolean;
+  models: OllamaModel[];
+  message?: string;
+}
+
 interface APIErrorEnvelope {
   error?: {
     code?: string;
@@ -89,4 +102,8 @@ export function beginGmailAuthorization(): Promise<GmailAuthorization> {
 
 export function loadGmailInbox(): Promise<GmailInboxPage> {
   return request("/api/v1/gmail/messages?limit=25");
+}
+
+export function ollamaStatus(): Promise<OllamaStatus> {
+  return request("/api/v1/ollama/status");
 }

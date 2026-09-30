@@ -20,6 +20,12 @@ func TestLoadUsesLoopbackDefaults(t *testing.T) {
 	if got.OAuthRedirectURL != "http://127.0.0.1:8787/api/v1/auth/gmail/callback" {
 		t.Fatalf("OAuthRedirectURL = %q", got.OAuthRedirectURL)
 	}
+	if got.OllamaBaseURL != defaultOllamaBaseURL {
+		t.Fatalf("OllamaBaseURL = %q, want %q", got.OllamaBaseURL, defaultOllamaBaseURL)
+	}
+	if !got.OllamaAutoStart {
+		t.Fatal("OllamaAutoStart = false, want true")
+	}
 }
 
 func TestLoadRejectsPublicBinding(t *testing.T) {
@@ -27,6 +33,42 @@ func TestLoadRejectsPublicBinding(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() succeeded with a public bind address")
+	}
+}
+
+func TestLoadRejectsRemoteOllamaEndpoint(t *testing.T) {
+	t.Setenv("OLLAMA_BASE_URL", "https://ollama.example.com")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() succeeded with a remote Ollama endpoint")
+	}
+}
+
+func TestLoadRejectsOllamaEndpointWithQuery(t *testing.T) {
+	t.Setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434?remote=value")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() succeeded with an Ollama endpoint query")
+	}
+}
+
+func TestLoadAllowsDisablingOllamaAutoStart(t *testing.T) {
+	t.Setenv("OLLAMA_AUTO_START", "false")
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.OllamaAutoStart {
+		t.Fatal("OllamaAutoStart = true, want false")
+	}
+}
+
+func TestLoadRejectsInvalidOllamaAutoStart(t *testing.T) {
+	t.Setenv("OLLAMA_AUTO_START", "sometimes")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an invalid OLLAMA_AUTO_START value")
 	}
 }
 

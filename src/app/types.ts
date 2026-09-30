@@ -36,3 +36,8 @@ export type ConnectionState =
   | { status: "not-configured" }
   | { status: "disconnected" }
   | { status: "connected"; emailAddress: string };
+
+export type LocalAIState =
+  | { status: "checking" }
+  | { status: "unavailable"; message: string }
+  | { status: "available"; models: string[] };

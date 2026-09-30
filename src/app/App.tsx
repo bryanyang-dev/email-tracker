@@ -5,10 +5,11 @@ import {
   createLocalSession,
   gmailConnectionStatus,
   loadGmailInbox,
+  ollamaStatus,
   type GmailInboxMessage,
 } from "./api";
 import { navigationItems } from "./navigation";
-import type { ConnectionState, EmailThread, ThreadView } from "./types";
+import type { ConnectionState, EmailThread, LocalAIState, ThreadView } from "./types";
 
 function threadsForView(view: ThreadView, allThreads: EmailThread[]): EmailThread[] {
   if (view === "all") return allThreads;
@@ -26,6 +27,7 @@ export function App() {
   const [view, setView] = useState<ThreadView>("active");
   const [allThreads, setAllThreads] = useState<EmailThread[]>([]);
   const [connection, setConnection] = useState<ConnectionState>({ status: "loading" });
+  const [localAI, setLocalAI] = useState<LocalAIState>({ status: "checking" });
   const [notice, setNotice] = useState<string | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
   const [selectedId, setSelectedId] = useState("");
@@ -49,6 +51,7 @@ export function App() {
   async function initialize() {
     try {
       await createLocalSession();
+      void refreshLocalAI();
       const status = await gmailConnectionStatus();
       if (!status.configured) {
         setConnection({ status: "not-configured" });
@@ -62,6 +65,19 @@ export function App() {
       await refreshInbox();
     } catch (error) {
       setConnection({ status: "offline", message: errorMessage(error) });
+    }
+  }
+
+  async function refreshLocalAI() {
+    try {
+      const status = await ollamaStatus();
+      setLocalAI(
+        status.available
+          ? { status: "available", models: status.models.map((model) => model.name) }
+          : { status: "unavailable", message: status.message ?? "Ollama is unavailable." },
+      );
+    } catch {
+      setLocalAI({ status: "unavailable", message: "Could not check Ollama." });
     }
   }
 
@@ -143,17 +159,29 @@ export function App() {
           </ul>
         </nav>
 
-        <div className="service-status">
-          <span
-            className={connection.status === "connected" ? "status-dot connected" : "status-dot"}
-            aria-hidden="true"
-          />
-          <span>
-            <strong>{connection.status === "connected" ? "Gmail connected" : "Local service"}</strong>
-            <small>
-              {connection.status === "connected" ? connection.emailAddress : connectionLabel(connection)}
-            </small>
-          </span>
+        <div className="service-statuses">
+          <div className="service-status">
+            <span
+              className={connection.status === "connected" ? "status-dot connected" : "status-dot"}
+              aria-hidden="true"
+            />
+            <span>
+              <strong>{connection.status === "connected" ? "Gmail connected" : "Local service"}</strong>
+              <small>
+                {connection.status === "connected" ? connection.emailAddress : connectionLabel(connection)}
+              </small>
+            </span>
+          </div>
+          <div className="service-status">
+            <span
+              className={localAI.status === "available" ? "status-dot connected" : "status-dot"}
+              aria-hidden="true"
+            />
+            <span>
+              <strong>{localAITitle(localAI)}</strong>
+              <small>{localAILabel(localAI)}</small>
+            </span>
+          </div>
         </div>
       </aside>
 
@@ -435,6 +463,25 @@ function connectionLabel(connection: ConnectionState): string {
     case "connected":
       return connection.emailAddress;
   }
+}
+
+function localAILabel(localAI: LocalAIState): string {
+  switch (localAI.status) {
+    case "checking":
+      return "Checking Ollama…";
+    case "unavailable":
+      return localAI.message;
+    case "available":
+      if (localAI.models.length === 0) return "No models installed";
+      if (localAI.models.length === 1) return localAI.models[0] ?? "1 model installed";
+      return `${localAI.models.length} models installed`;
+  }
+}
+
+function localAITitle(localAI: LocalAIState): string {
+  if (localAI.status === "checking") return "Checking local AI";
+  if (localAI.status === "unavailable") return "Local AI unavailable";
+  return localAI.models.length ? "Local AI ready" : "Ollama running";
 }
 
 function errorMessage(error: unknown): string {

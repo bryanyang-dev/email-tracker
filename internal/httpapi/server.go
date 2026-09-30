@@ -19,6 +19,7 @@ import (
 	"local-email-workspace/internal/config"
 	"local-email-workspace/internal/credentials"
 	"local-email-workspace/internal/googleapi"
+	"local-email-workspace/internal/ollama"
 )
 
 const sessionCookieName = "lew_session"
@@ -34,6 +35,7 @@ type Server struct {
 	store    credentials.Store
 	oauth    *googleapi.OAuthClient
 	gmail    *googleapi.GmailClient
+	ollama   *ollama.Client
 	mux      *http.ServeMux
 	mu       sync.RWMutex
 	sessions map[string]time.Time
@@ -46,6 +48,7 @@ func New(cfg config.Config, store credentials.Store, httpClient *http.Client) *S
 		store:    store,
 		oauth:    googleapi.NewOAuthClient(httpClient, cfg.GmailClientID, cfg.GmailClientSecret, cfg.OAuthRedirectURL),
 		gmail:    googleapi.NewGmailClient(httpClient),
+		ollama:   ollama.NewClient(cfg.OllamaBaseURL, httpClient),
 		mux:      http.NewServeMux(),
 		sessions: make(map[string]time.Time),
 		pending:  make(map[string]pendingAuthorization),
@@ -66,6 +69,40 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/auth/gmail/callback", s.handleGmailCallback)
 	s.mux.Handle("POST /api/v1/auth/gmail/disconnect", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleGmailDisconnect))))
 	s.mux.Handle("GET /api/v1/gmail/messages", s.authenticated(http.HandlerFunc(s.handleInbox)))
+	s.mux.Handle("GET /api/v1/ollama/status", s.authenticated(http.HandlerFunc(s.handleOllamaStatus)))
+}
+
+type ollamaModelResponse struct {
+	Name              string `json:"name"`
+	ParameterSize     string `json:"parameterSize,omitempty"`
+	QuantizationLevel string `json:"quantizationLevel,omitempty"`
+	Size              int64  `json:"size"`
+}
+
+func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
+	models, err := s.ollama.InstalledModels(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"available": false,
+			"models":    []ollamaModelResponse{},
+			"message":   "Ollama is not running on the configured loopback endpoint.",
+		})
+		return
+	}
+
+	responseModels := make([]ollamaModelResponse, len(models))
+	for index, model := range models {
+		responseModels[index] = ollamaModelResponse{
+			Name:              model.Name,
+			ParameterSize:     model.Details.ParameterSize,
+			QuantizationLevel: model.Details.QuantizationLevel,
+			Size:              model.Size,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": true,
+		"models":    responseModels,
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
