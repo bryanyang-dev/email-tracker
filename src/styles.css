@@ -500,6 +500,14 @@ h1 {
   font-family: Georgia, serif;
   font-size: 18px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.latest-update small {
+  display: block;
+  margin-top: 8px;
+  color: #7b543f;
 }
 
 .local-ai {

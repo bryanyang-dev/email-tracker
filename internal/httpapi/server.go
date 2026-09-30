@@ -69,6 +69,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/auth/gmail/callback", s.handleGmailCallback)
 	s.mux.Handle("POST /api/v1/auth/gmail/disconnect", s.authenticated(s.requireOrigin(http.HandlerFunc(s.handleGmailDisconnect))))
 	s.mux.Handle("GET /api/v1/gmail/messages", s.authenticated(http.HandlerFunc(s.handleInbox)))
+	s.mux.Handle("GET /api/v1/gmail/threads/{threadID}", s.authenticated(http.HandlerFunc(s.handleThread)))
 	s.mux.Handle("GET /api/v1/ollama/status", s.authenticated(http.HandlerFunc(s.handleOllamaStatus)))
 }
 
@@ -251,6 +252,33 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
+	threadID := r.PathValue("threadID")
+	if threadID == "" || len(threadID) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_thread_id", "A valid Gmail thread ID is required.")
+		return
+	}
+
+	credential, err := s.validCredential(r.Context())
+	if errors.Is(err, credentials.ErrNotFound) {
+		writeError(w, http.StatusUnauthorized, "gmail_not_connected", "Connect Gmail before loading a conversation.")
+		return
+	}
+	if err != nil {
+		slog.Error("gmail credential refresh failed", "error", err)
+		writeError(w, http.StatusUnauthorized, "gmail_reauthorization_required", "Gmail authorization needs to be renewed.")
+		return
+	}
+
+	conversation, err := s.gmail.Thread(r.Context(), credential, threadID)
+	if err != nil {
+		slog.Error("gmail thread request failed", "error", err)
+		writeError(w, http.StatusBadGateway, "gmail_thread_request_failed", "Could not retrieve the conversation from Gmail.")
+		return
+	}
+	writeJSON(w, http.StatusOK, conversation)
 }
 
 func (s *Server) handleGmailDisconnect(w http.ResponseWriter, r *http.Request) {

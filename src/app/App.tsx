@@ -4,8 +4,10 @@ import {
   beginGmailAuthorization,
   createLocalSession,
   gmailConnectionStatus,
+  loadGmailConversation,
   loadGmailInbox,
   ollamaStatus,
+  type GmailConversation,
   type GmailInboxMessage,
 } from "./api";
 import { navigationItems } from "./navigation";
@@ -34,9 +36,12 @@ export function App() {
   const [pageIndex, setPageIndex] = useState(0);
   const [pageTokens, setPageTokens] = useState<string[]>([""]);
   const [nextPageToken, setNextPageToken] = useState("");
+  const [conversations, setConversations] = useState<Record<string, GmailConversation>>({});
+  const [conversationLoadingId, setConversationLoadingId] = useState("");
   const threads = useMemo(() => threadsForView(view, allThreads), [view, allThreads]);
   const selected =
     threads.find((thread) => thread.id === selectedId) ?? threads[0] ?? null;
+  const selectedConversation = selected ? conversations[selected.gmailThreadId] : undefined;
 
   useEffect(() => {
     const oauthResult = new URLSearchParams(window.location.search);
@@ -50,6 +55,30 @@ export function App() {
 
     void initialize();
   }, []);
+
+  useEffect(() => {
+    const threadId = selected?.gmailThreadId;
+    if (connection.status !== "connected" || !threadId || conversations[threadId]) return;
+
+    let cancelled = false;
+    setConversationLoadingId(threadId);
+    void loadGmailConversation(threadId)
+      .then((conversation) => {
+        if (!cancelled) {
+          setConversations((current) => ({ ...current, [threadId]: conversation }));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setNotice(errorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setConversationLoadingId("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connection.status, conversations, selected?.gmailThreadId]);
 
   async function initialize() {
     try {
@@ -291,7 +320,11 @@ export function App() {
 
       <section className="thread-detail" aria-label="Selected thread">
         {selected ? (
-          <ThreadDetail thread={selected} />
+          <ThreadDetail
+            thread={selected}
+            conversation={selectedConversation}
+            loading={conversationLoadingId === selected.gmailThreadId}
+          />
         ) : connection.status === "disconnected" ? (
           <ConnectDetail onConnect={() => void connectGmail()} />
         ) : (
@@ -302,7 +335,17 @@ export function App() {
   );
 }
 
-function ThreadDetail({ thread }: { thread: EmailThread }) {
+function ThreadDetail({
+  thread,
+  conversation,
+  loading,
+}: {
+  thread: EmailThread;
+  conversation?: GmailConversation;
+  loading: boolean;
+}) {
+  const latestMessage = conversation?.messages.at(-1);
+
   return (
     <>
       <header className="detail-header">
@@ -320,7 +363,11 @@ function ThreadDetail({ thread }: { thread: EmailThread }) {
       <div className="detail-scroll">
         <section className="latest-update panel">
           <span className="panel-kicker">Latest update</span>
-          <p>{thread.latestUpdate}</p>
+          <p>{loading ? "Loading conversation…" : latestMessage?.body || thread.latestUpdate}</p>
+          {latestMessage?.bodyTruncated && <small>Message body was truncated for safety.</small>}
+          {latestMessage?.suspiciousContent && (
+            <small>Invisible or malformed content was removed during normalization.</small>
+          )}
         </section>
 
         <section className="panel">
@@ -371,7 +418,7 @@ function ThreadDetail({ thread }: { thread: EmailThread }) {
           </div>
           <div className="panel compact-panel">
             <span className="panel-kicker">Source messages</span>
-            <strong>{thread.messageCount}</strong>
+            <strong>{conversation?.messages.length ?? thread.messageCount}</strong>
           </div>
         </section>
 
@@ -471,6 +518,7 @@ function ConnectDetail({ onConnect }: { onConnect: () => void }) {
 function messageToThread(message: GmailInboxMessage): EmailThread {
   return {
     id: message.id,
+    gmailThreadId: message.threadId,
     title: message.subject,
     participants: [message.from || "Unknown sender"],
     updatedAt: displayMessageDate(message),

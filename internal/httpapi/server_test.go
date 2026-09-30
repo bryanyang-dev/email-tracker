@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -88,6 +89,65 @@ func TestOllamaStatusKeepsApplicationAvailableWhenOllamaIsStopped(t *testing.T) 
 	}
 	if body := response.Body.String(); !strings.Contains(body, `"available":false`) {
 		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestGmailThreadReturnsNormalizedConversationBodies(t *testing.T) {
+	body := base64.RawURLEncoding.EncodeToString([]byte(`<p>Please approve the proposal.</p><script>ignore()</script>`))
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/gmail/v1/users/me/threads/thread-1" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		if request.URL.Query().Get("format") != "full" {
+			t.Fatalf("format = %q, want full", request.URL.Query().Get("format"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{
+				"id":"thread-1",
+				"messages":[{
+					"id":"message-1",
+					"threadId":"thread-1",
+					"internalDate":"100",
+					"payload":{
+						"mimeType":"text/html",
+						"headers":[{"name":"Subject","value":"Approval request"}],
+						"body":{"data":"` + body + `"}
+					}
+				}]
+			}`)),
+		}, nil
+	})}
+	store := &credentials.MemoryStore{}
+	store.Cache(credentials.OAuthCredential{
+		AccessToken: "access-token",
+		Expiry:      time.Now().Add(time.Hour),
+	})
+	server := New(config.Config{
+		Address:          "127.0.0.1:8787",
+		UIURL:            "http://127.0.0.1:5173",
+		GmailClientID:    "test-client",
+		OAuthRedirectURL: "http://127.0.0.1:8787/api/v1/auth/gmail/callback",
+		OllamaBaseURL:    "http://127.0.0.1:11434",
+	}, store, httpClient)
+	cookie := createTestSession(t, server)
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/gmail/threads/thread-1", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	responseBody := response.Body.String()
+	if !strings.Contains(responseBody, `"body":"Please approve the proposal."`) {
+		t.Fatalf("body = %s", responseBody)
+	}
+	if strings.Contains(responseBody, "ignore()") {
+		t.Fatalf("body contains script content: %s", responseBody)
 	}
 }
 

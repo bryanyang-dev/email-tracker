@@ -40,6 +40,29 @@ describe("App", () => {
           resultSize: 2,
         });
       }
+      if (path === "/api/v1/gmail/threads/thread-1") {
+        return jsonResponse({
+          id: "thread-1",
+          historyId: "history-1",
+          messages: [
+            {
+              id: "message-1",
+              threadId: "thread-1",
+              subject: "Vendor renewal",
+              from: "Morgan Lee <morgan@example.com>",
+              to: "person@example.com",
+              date: "Tue, 29 Sep 2026 10:00:00 -0400",
+              internalAt: "1790683200000",
+              labelIds: ["INBOX", "UNREAD"],
+              body: "Please approve the revised terms by Friday.",
+              bodySource: "plain",
+              bodyTruncated: false,
+              suspiciousContent: false,
+            },
+          ],
+          truncated: false,
+        });
+      }
       if (path === "/api/v1/gmail/messages?limit=5&pageToken=next-page-token") {
         return jsonResponse({
           messages: [
@@ -59,6 +82,29 @@ describe("App", () => {
           resultSize: 2,
         });
       }
+      if (path === "/api/v1/gmail/threads/thread-2") {
+        return jsonResponse({
+          id: "thread-2",
+          historyId: "history-2",
+          messages: [
+            {
+              id: "message-2",
+              threadId: "thread-2",
+              subject: "Planning update",
+              from: "Alex Kim <alex@example.com>",
+              to: "person@example.com",
+              date: "Tue, 29 Sep 2026 11:00:00 -0400",
+              internalAt: "1790686800000",
+              labelIds: ["INBOX"],
+              body: "The revised schedule is ready for review.",
+              bodySource: "plain",
+              bodyTruncated: false,
+              suspiciousContent: false,
+            },
+          ],
+          truncated: false,
+        });
+      }
       return jsonResponse({}, 500);
     }));
 
@@ -69,6 +115,7 @@ describe("App", () => {
     expect(screen.getByText("Connected as person@example.com")).toBeInTheDocument();
     expect(screen.getByText("Local AI ready")).toBeInTheDocument();
     expect(screen.getByText("llama3.2:3b")).toBeInTheDocument();
+    expect(await screen.findByText("Please approve the revised terms by Friday.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
     expect(await screen.findByRole("heading", { name: "Planning update" })).toBeInTheDocument();

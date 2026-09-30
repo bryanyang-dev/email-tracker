@@ -23,6 +23,30 @@ export interface GmailInboxPage {
   resultSize: number;
 }
 
+export interface GmailConversationMessage {
+  id: string;
+  threadId: string;
+  rfcMessageId?: string;
+  subject: string;
+  from: string;
+  to: string;
+  cc?: string;
+  date: string;
+  internalAt: string;
+  labelIds: string[];
+  body: string;
+  bodySource: "plain" | "html" | "mixed" | "none";
+  bodyTruncated: boolean;
+  suspiciousContent: boolean;
+}
+
+export interface GmailConversation {
+  id: string;
+  historyId: string;
+  messages: GmailConversationMessage[];
+  truncated: boolean;
+}
+
 export interface OllamaModel {
   name: string;
   parameterSize?: string;
@@ -104,6 +128,10 @@ export function loadGmailInbox(pageToken = ""): Promise<GmailInboxPage> {
   const query = new URLSearchParams({ limit: "5" });
   if (pageToken) query.set("pageToken", pageToken);
   return request(`/api/v1/gmail/messages?${query.toString()}`);
+}
+
+export function loadGmailConversation(threadId: string): Promise<GmailConversation> {
+  return request(`/api/v1/gmail/threads/${encodeURIComponent(threadId)}`);
 }
 
 export function ollamaStatus(): Promise<OllamaStatus> {

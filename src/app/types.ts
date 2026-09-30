@@ -16,6 +16,7 @@ export interface ActionItem {
 
 export interface EmailThread {
   id: string;
+  gmailThreadId: string;
   title: string;
   participants: string[];
   updatedAt: string;

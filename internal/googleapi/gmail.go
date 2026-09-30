@@ -2,19 +2,31 @@ package googleapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
 	"local-email-workspace/internal/credentials"
+	"local-email-workspace/internal/mailbody"
 )
 
 const gmailAPIBaseURL = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+const (
+	maxThreadResponseBytes   = 16 << 20
+	maxDecodedTextPartBytes  = 2 << 20
+	maxConversationTextBytes = 8 << 20
+	maxThreadMessages        = 200
+	maxDecodedMIMEParts      = 512
+	maxDecodedMIMEDepth      = 32
+)
 
 type GmailClient struct {
 	httpClient *http.Client
@@ -46,6 +58,30 @@ type InboxPage struct {
 	ResultSize    int            `json:"resultSize"`
 }
 
+type Conversation struct {
+	ID        string                `json:"id"`
+	HistoryID string                `json:"historyId"`
+	Messages  []ConversationMessage `json:"messages"`
+	Truncated bool                  `json:"truncated"`
+}
+
+type ConversationMessage struct {
+	ID                string   `json:"id"`
+	ThreadID          string   `json:"threadId"`
+	RFCMessageID      string   `json:"rfcMessageId,omitempty"`
+	Subject           string   `json:"subject"`
+	From              string   `json:"from"`
+	To                string   `json:"to"`
+	Cc                string   `json:"cc,omitempty"`
+	Date              string   `json:"date"`
+	InternalAt        string   `json:"internalAt"`
+	LabelIDs          []string `json:"labelIds"`
+	Body              string   `json:"body"`
+	BodySource        string   `json:"bodySource"`
+	BodyTruncated     bool     `json:"bodyTruncated"`
+	SuspiciousContent bool     `json:"suspiciousContent"`
+}
+
 type messageListResponse struct {
 	Messages []struct {
 		ID       string `json:"id"`
@@ -55,18 +91,39 @@ type messageListResponse struct {
 	ResultSizeEstimate int    `json:"resultSizeEstimate"`
 }
 
+type messageHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type messagePartBody struct {
+	AttachmentID string `json:"attachmentId"`
+	Size         int    `json:"size"`
+	Data         string `json:"data"`
+}
+
+type messagePart struct {
+	PartID   string          `json:"partId"`
+	MIMEType string          `json:"mimeType"`
+	Filename string          `json:"filename"`
+	Headers  []messageHeader `json:"headers"`
+	Body     messagePartBody `json:"body"`
+	Parts    []messagePart   `json:"parts"`
+}
+
 type messageResponse struct {
-	ID           string   `json:"id"`
-	ThreadID     string   `json:"threadId"`
-	LabelIDs     []string `json:"labelIds"`
-	Snippet      string   `json:"snippet"`
-	InternalDate string   `json:"internalDate"`
-	Payload      struct {
-		Headers []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		} `json:"headers"`
-	} `json:"payload"`
+	ID           string      `json:"id"`
+	ThreadID     string      `json:"threadId"`
+	LabelIDs     []string    `json:"labelIds"`
+	Snippet      string      `json:"snippet"`
+	InternalDate string      `json:"internalDate"`
+	Payload      messagePart `json:"payload"`
+}
+
+type threadResponse struct {
+	ID        string            `json:"id"`
+	HistoryID string            `json:"historyId"`
+	Messages  []messageResponse `json:"messages"`
 }
 
 func NewGmailClient(httpClient *http.Client) *GmailClient {
@@ -132,6 +189,158 @@ func (c *GmailClient) Inbox(ctx context.Context, credential credentials.OAuthCre
 	}, nil
 }
 
+func (c *GmailClient) Thread(ctx context.Context, credential credentials.OAuthCredential, threadID string) (Conversation, error) {
+	query := url.Values{"format": {"full"}}
+	endpoint := gmailAPIBaseURL + "/threads/" + url.PathEscape(threadID) + "?" + query.Encode()
+
+	var response threadResponse
+	if err := c.getJSONLimit(ctx, endpoint, credential, &response, maxThreadResponseBytes); err != nil {
+		return Conversation{}, err
+	}
+
+	providerMessages := response.Messages
+	truncated := len(providerMessages) > maxThreadMessages
+	if truncated {
+		providerMessages = providerMessages[len(providerMessages)-maxThreadMessages:]
+	}
+
+	messages := make([]ConversationMessage, 0, len(providerMessages))
+	decodedTextBytes := 0
+	for _, providerMessage := range providerMessages {
+		normalized, err := c.normalizeConversationMessage(ctx, credential, providerMessage, &decodedTextBytes)
+		if err != nil {
+			return Conversation{}, fmt.Errorf("normalize Gmail message %s: %w", providerMessage.ID, err)
+		}
+		messages = append(messages, normalized)
+	}
+	sort.SliceStable(messages, func(left, right int) bool {
+		leftTime, _ := strconv.ParseInt(messages[left].InternalAt, 10, 64)
+		rightTime, _ := strconv.ParseInt(messages[right].InternalAt, 10, 64)
+		return leftTime < rightTime
+	})
+
+	return Conversation{
+		ID:        response.ID,
+		HistoryID: response.HistoryID,
+		Messages:  messages,
+		Truncated: truncated,
+	}, nil
+}
+
+func (c *GmailClient) normalizeConversationMessage(
+	ctx context.Context,
+	credential credentials.OAuthCredential,
+	message messageResponse,
+	decodedTextBytes *int,
+) (ConversationMessage, error) {
+	partCount := 0
+	part, err := c.decodeMessagePart(ctx, credential, message.ID, message.Payload, 0, &partCount, decodedTextBytes)
+	if err != nil {
+		return ConversationMessage{}, err
+	}
+	result := mailbody.Normalize(part)
+	headers := headerValues(message.Payload.Headers)
+
+	return ConversationMessage{
+		ID:                message.ID,
+		ThreadID:          message.ThreadID,
+		RFCMessageID:      headers["message-id"],
+		Subject:           fallback(headers["subject"], "(No subject)"),
+		From:              headers["from"],
+		To:                headers["to"],
+		Cc:                headers["cc"],
+		Date:              headers["date"],
+		InternalAt:        message.InternalDate,
+		LabelIDs:          message.LabelIDs,
+		Body:              result.Text,
+		BodySource:        fallback(result.Source, "none"),
+		BodyTruncated:     result.Truncated,
+		SuspiciousContent: result.SuspiciousContent,
+	}, nil
+}
+
+func (c *GmailClient) decodeMessagePart(
+	ctx context.Context,
+	credential credentials.OAuthCredential,
+	messageID string,
+	part messagePart,
+	depth int,
+	partCount *int,
+	decodedTextBytes *int,
+) (mailbody.Part, error) {
+	*partCount++
+	if depth > maxDecodedMIMEDepth || *partCount > maxDecodedMIMEParts {
+		return mailbody.Part{MIMEType: part.MIMEType, Truncated: true}, nil
+	}
+	disposition := headerValues(part.Headers)["content-disposition"]
+	normalized := mailbody.Part{
+		MIMEType:    part.MIMEType,
+		Filename:    part.Filename,
+		Disposition: disposition,
+		Parts:       make([]mailbody.Part, 0, len(part.Parts)),
+	}
+
+	isAttachment := part.Filename != "" || strings.HasPrefix(strings.ToLower(strings.TrimSpace(disposition)), "attachment")
+	isText := strings.HasPrefix(strings.ToLower(strings.TrimSpace(part.MIMEType)), "text/")
+	if !isAttachment && isText {
+		remaining := maxConversationTextBytes - *decodedTextBytes
+		if remaining <= 0 {
+			normalized.Truncated = true
+		} else {
+			encoded := part.Body.Data
+			if encoded == "" && part.Body.AttachmentID != "" {
+				var body messagePartBody
+				endpoint := gmailAPIBaseURL + "/messages/" + url.PathEscape(messageID) +
+					"/attachments/" + url.PathEscape(part.Body.AttachmentID)
+				if err := c.getJSONLimit(ctx, endpoint, credential, &body, 3<<20); err != nil {
+					return mailbody.Part{}, fmt.Errorf("fetch external text body: %w", err)
+				}
+				encoded = body.Data
+			}
+			partLimit := min(maxDecodedTextPartBytes, remaining)
+			decoded, truncated, err := decodeBase64URL(encoded, partLimit)
+			if err != nil {
+				return mailbody.Part{}, fmt.Errorf("decode %s body: %w", part.MIMEType, err)
+			}
+			normalized.Data = decoded
+			normalized.Truncated = truncated
+			*decodedTextBytes += len(decoded)
+		}
+	}
+
+	for _, child := range part.Parts {
+		decoded, err := c.decodeMessagePart(ctx, credential, messageID, child, depth+1, partCount, decodedTextBytes)
+		if err != nil {
+			return mailbody.Part{}, err
+		}
+		normalized.Parts = append(normalized.Parts, decoded)
+	}
+	return normalized, nil
+}
+
+func decodeBase64URL(encoded string, limit int) ([]byte, bool, error) {
+	if encoded == "" {
+		return nil, false, nil
+	}
+	encodedLimit := base64.RawURLEncoding.EncodedLen(limit)
+	truncated := len(encoded) > encodedLimit
+	if truncated {
+		encoded = encoded[:encodedLimit]
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(encoded)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if len(decoded) > limit {
+		decoded = decoded[:limit]
+		truncated = true
+	}
+	return decoded, truncated, nil
+}
+
 func (c *GmailClient) message(ctx context.Context, credential credentials.OAuthCredential, id string) (InboxMessage, error) {
 	query := url.Values{"format": {"metadata"}}
 	for _, header := range []string{"Subject", "From", "To", "Date", "Message-ID", "In-Reply-To", "References"} {
@@ -144,10 +353,7 @@ func (c *GmailClient) message(ctx context.Context, credential credentials.OAuthC
 		return InboxMessage{}, err
 	}
 
-	headers := make(map[string]string, len(response.Payload.Headers))
-	for _, header := range response.Payload.Headers {
-		headers[strings.ToLower(header.Name)] = header.Value
-	}
+	headers := headerValues(response.Payload.Headers)
 
 	return InboxMessage{
 		ID:         response.ID,
@@ -164,6 +370,16 @@ func (c *GmailClient) message(ctx context.Context, credential credentials.OAuthC
 }
 
 func (c *GmailClient) getJSON(ctx context.Context, endpoint string, credential credentials.OAuthCredential, target any) error {
+	return c.getJSONLimit(ctx, endpoint, credential, target, 4<<20)
+}
+
+func (c *GmailClient) getJSONLimit(
+	ctx context.Context,
+	endpoint string,
+	credential credentials.OAuthCredential,
+	target any,
+	responseLimit int64,
+) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("create Gmail request: %w", err)
@@ -181,10 +397,18 @@ func (c *GmailClient) getJSON(ctx context.Context, endpoint string, credential c
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
 		return fmt.Errorf("Gmail API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(target); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Body, responseLimit)).Decode(target); err != nil {
 		return fmt.Errorf("decode Gmail response: %w", err)
 	}
 	return nil
+}
+
+func headerValues(headers []messageHeader) map[string]string {
+	values := make(map[string]string, len(headers))
+	for _, header := range headers {
+		values[strings.ToLower(header.Name)] = header.Value
+	}
+	return values
 }
 
 func contains(values []string, wanted string) bool {
