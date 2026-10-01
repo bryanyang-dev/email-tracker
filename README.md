@@ -3,6 +3,27 @@
 A macOS-first, local email workspace. The React client is served by a local Go
 service and communicates with it through a same-origin `/api/v1` API.
 
+## What the app does
+
+Local Email Workspace turns a Gmail inbox into a smaller, locally maintained
+set of conversations that are likely to matter. Routine browsing reads from a
+local SQLite index, so opening and filtering conversations does not repeatedly
+fetch messages from Gmail or run AI classification.
+
+- Connects to one Gmail account using read-only OAuth access.
+- Builds a resumable index of the previous two weeks of email, then uses Gmail
+  history to retrieve only new changes on later visits.
+- Filters obvious bulk and low-value mail, then uses deterministic rules and an
+  optional local Ollama model to identify urgent or actionable messages.
+- Groups related messages and Gmail threads into conversations using reply
+  headers, normalized subjects, sender and organization signals, and time.
+- Presents locally stored conversations and message bodies in categorized,
+  scrollable views with counts across the full inbox index.
+
+Email content and derived classifications remain on the Mac in SQLite. OAuth
+credentials are stored in macOS Keychain, and AI processing uses local Ollama
+without a cloud fallback.
+
 ## Prerequisites
 
 - Node.js and npm
